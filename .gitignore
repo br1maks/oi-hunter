@@ -1,0 +1,53 @@
+
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Backtesting data cache
+backtest_data/cache/
+backtest_data/results/logs/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+poetry.lock
+.venv/
+dist/
+*.egg-info/

@@ -1,0 +1,31 @@
+# Виртуальное окружение
+venv/
+env/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Git
+.git/
+
+# Логи и временные файлы
+*.log
+logs/
+*.tmp
+
+# IDE
+.idea/
+*.swp
+
+# База данных (если есть)
+*.db
+*.sqlite3
+
+# Переменные окружения
+.env
+.env.local
