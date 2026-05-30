@@ -24,6 +24,12 @@ class VolumeSpikeAnalyzer(BaseAnalyzer):
     def _calculate_volume_ratio(self, data: MarketData) -> float:
         return data.volume_1h / data.avg_volume_1h
 
+    def _price_move_threshold(self, data: MarketData) -> float:
+        if data.atr and data.atr > 0:
+            atr_pct = data.atr / data.price * 100
+            return min(15.0, max(5.0, atr_pct * 0.3))
+        return 5.0
+
     def _score_spike(self, ratio: float) -> float:
         if ratio >= 5.0:
             return 10.0
@@ -31,6 +37,8 @@ class VolumeSpikeAnalyzer(BaseAnalyzer):
             return 9.0
         elif ratio >= 2.0:
             return 7.0
+        elif ratio >= 1.75:
+            return 6.0
         elif ratio >= 1.5:
             return 5.0
         else:
@@ -44,14 +52,15 @@ class VolumeSpikeAnalyzer(BaseAnalyzer):
         if spike_score == 0:
             return None
         price_change = data.price_change_1h if data.price_change_1h is not None else 0
-        if price_change < -5:
+        price_threshold = self._price_move_threshold(data)
+        if price_change <= -price_threshold:
             long_score = 0.0
             short_score = spike_score
             direction = 'BEARISH'
             blocks_long = volume_ratio >= 2.0
             blocks_short = False
             is_early_detection = False
-        elif price_change > 5:
+        elif price_change >= price_threshold:
             long_score = spike_score
             short_score = 0.0
             direction = 'BULLISH'
@@ -59,17 +68,29 @@ class VolumeSpikeAnalyzer(BaseAnalyzer):
             blocks_short = volume_ratio >= 2.0
             is_early_detection = False
         else:
-            aggression = data.aggression_2h
-            if aggression is None:
+            # PRE_PUMP/PRE_DUMP requires a reliable aggression reading.
+            # Prefer 5m (current momentum) if count is sufficient; fall back to 2h if also sufficient.
+            # Without enough trades the reading is noise — don't fire early detection on it.
+            if (data.aggression_5m is not None
+                    and data.trade_count_5m is not None
+                    and data.trade_count_5m >= 20):
+                aggression = data.aggression_5m
+                agg_source = '5M'
+            elif (data.aggression_2h is not None
+                    and data.trade_count_2h is not None
+                    and data.trade_count_2h >= 50):
+                aggression = data.aggression_2h
+                agg_source = '2H'
+            else:
                 return None
-            if aggression >= 70 and volume_ratio >= 2.0:
+            if aggression >= 70 and volume_ratio >= 3.0:
                 long_score = spike_score * 0.7
                 short_score = 0.0
                 direction = 'PRE_PUMP'
                 blocks_long = False
                 blocks_short = True
                 is_early_detection = True
-            elif aggression <= 30 and volume_ratio >= 2.0:
+            elif aggression <= 30 and volume_ratio >= 3.0:
                 long_score = 0.0
                 short_score = spike_score * 0.7
                 direction = 'PRE_DUMP'
@@ -80,13 +101,13 @@ class VolumeSpikeAnalyzer(BaseAnalyzer):
                 return None
         if volume_ratio >= 5.0:
             alert_level = 'critical'
-        elif volume_ratio >= 2.0:
+        elif volume_ratio >= 1.75:
             alert_level = 'warning'
         else:
             alert_level = 'info'
         if is_early_detection:
-            aggression = data.aggression_2h
-            reasoning = f'Volume spike {volume_ratio:.1f}x | Direction: {direction} (EARLY!) | Aggression: {aggression:.0f}% | Price: {price_change:+.1f}% (not moved yet)'
+            price_str = f'{data.price_change_1h:+.1f}%' if data.price_change_1h is not None else 'N/A'
+            reasoning = f'Volume spike {volume_ratio:.1f}x | Direction: {direction} (EARLY!) | Aggression ({agg_source}): {aggression:.0f}% | Price: {price_str}'
         else:
             reasoning = f'Volume spike {volume_ratio:.1f}x | Direction: {direction} | Price change: {price_change:+.1f}%'
         confidence = self._calculate_confidence(data, volume_ratio, is_early_detection)
@@ -94,21 +115,12 @@ class VolumeSpikeAnalyzer(BaseAnalyzer):
 
     def _calculate_confidence(self, data: MarketData, volume_ratio: float, is_early_detection: bool=False) -> float:
         if is_early_detection:
-            confidence = 0.5
-            confidence += 0.1
             if volume_ratio >= 5.0:
-                confidence += 0.2
-            elif volume_ratio >= 3.0:
-                confidence += 0.15
-            elif volume_ratio >= 2.0:
-                confidence += 0.1
-            return min(0.75, confidence)
+                return 0.70
+            return 0.65
         else:
-            confidence = 0.5
-            if data.price_change_1h is not None:
-                confidence += 0.2
             if volume_ratio >= 3.0:
-                confidence += 0.2
+                return 0.9
             elif volume_ratio >= 2.0:
-                confidence += 0.1
-            return min(1.0, confidence)
+                return 0.8
+            return 0.7

@@ -31,6 +31,8 @@ class MarketData(BaseModel):
     funding_rate: float = Field(..., description='Current funding rate')
     buy_volume_5m: Optional[float] = Field(None, ge=0, description='Buy volume in 5 min')
     sell_volume_5m: Optional[float] = Field(None, ge=0, description='Sell volume in 5 min')
+    trade_count_5m: Optional[int] = Field(None, ge=0, description='Number of individual trades in last 5 min')
+    trade_count_2h: Optional[int] = Field(None, ge=0, description='Number of individual trades in last 2 hours')
     buy_volume_2h: Optional[float] = Field(None, ge=0, description='Buy volume in 2 hours')
     sell_volume_2h: Optional[float] = Field(None, ge=0, description='Sell volume in 2 hours')
 
@@ -66,6 +68,11 @@ class MarketData(BaseModel):
     ob_t2_bid_vol: Optional[float] = Field(None, ge=0, description='Bid volume 0.5–2% below price (Tier 2, near-term)')
     ob_t2_ask_vol: Optional[float] = Field(None, ge=0, description='Ask volume 0.5–2% above price (Tier 2, near-term)')
     ob_spread_pct: Optional[float] = Field(None, ge=0, description='Bid-ask spread as % of price')
+
+    # Squeeze Detector inputs (computed in DataAggregator._parse_klines)
+    vci: Optional[float] = Field(None, ge=0, description='Volatility Compression Index (ATR_5/ATR_20, < 0.65 = compressed)')
+    cfc: int = Field(default=0, ge=0, description='Consecutive flat candles count (range < 1.5%)')
+    vwap: Optional[float] = Field(None, gt=0, description='24h VWAP (typical price weighted by volume)')
 
     class Config:
         json_schema_extra = {'example': {'symbol': 'LIGHTUSDT', 'exchange': 'MEXC', 'timestamp': '2026-01-26T18:30:00Z', 'price': 0.35, 'high_24h': 0.42, 'low_24h': 0.33, 'volume_24h': 1500000, 'volume_1h': 85000, 'avg_volume_1h': 62500, 'price_change_1h': -2.5, 'price_change_4h': -8.3, 'price_change_24h': -15.3, 'atr': 0.028, 'open_interest_usd': 1500000, 'oi_change_5m': -8.2, 'oi_change_1h': -15.0, 'market_cap_usd': 4285714, 'circulating_supply': 12244897, 'fdv': 8500000, 'funding_rate': -0.0012, 'buy_volume_5m': 85000, 'sell_volume_5m': 215000, 'buy_volume_2h': 2500000, 'sell_volume_2h': 3500000, 'liquidation_detected': True, 'liquidation_side': 'LONGS', 'liquidation_volume': 350000, 'liquidation_context': 'AFTER', 'is_new_listing': True, 'days_since_listing': 12}}

@@ -35,14 +35,14 @@ class OrderBookAnalyzer(BaseAnalyzer):
             return (6.0, 4.0, f'Balanced book, bids lead {ratio:.1f}x')
         elif ratio >= 0.83:
             return (5.0, 5.0, f'Balanced order book {ratio:.1f}x — neutral')
-        elif ratio >= 0.67:
-            return (4.0, 6.0, f'Asks slightly dominant {ratio:.1f}x — mild sell pressure')
-        elif ratio >= 0.5:
-            return (3.0, 7.0, f'Asks dominate {ratio:.1f}x — sellers in control')
-        elif ratio >= 0.33:
-            return (2.0, 8.0, f'Asks dominate {ratio:.1f}x — strong sell pressure')
+        elif ratio > 0.67:
+            return (4.0, 6.0, f'Asks slightly dominant {1/ratio:.1f}x — mild sell pressure')
+        elif ratio > 0.5:
+            return (3.0, 7.0, f'Asks dominate {1/ratio:.1f}x — sellers in control')
+        elif ratio > 0.33:
+            return (2.0, 8.0, f'Asks dominate {1/ratio:.1f}x — strong sell pressure')
         else:
-            return (1.0, 9.0, f'Asks dominate {ratio:.1f}x — extreme sell pressure')
+            return (1.0, 9.0, f'Asks dominate {1/ratio:.1f}x — extreme sell pressure')
 
     def analyze(self, data: MarketData) -> Optional[AnalyzerResult]:
         if not self._validate_data(data):
@@ -98,7 +98,7 @@ class OrderBookAnalyzer(BaseAnalyzer):
         else:
             alert_level = 'info'
         confidence = 0.75
-        if abs(imbalance - 1.0) > 1.0:
+        if imbalance >= 2.0 or imbalance <= 0.5:
             confidence += 0.05
         if data.ob_spread_pct is not None:
             if data.ob_spread_pct < 0.05:

@@ -61,21 +61,29 @@ class AlreadyPumpedAnalyzer(BaseAnalyzer):
             alert_level = 'warning'
             severity = 'MODERATE'
         else:
-            long_score = 5.0
-            short_score = 4.0
+            long_score = 4.5
+            short_score = 5.0
             blocks_long = False
             alert_level = 'info'
             severity = 'LOW'
-        reasoning = f'Already pumped +{pump:.1f}% | Risk: {severity} | Long entry risk elevated'
+        is_fresh_listing = data.is_new_listing and (data.days_since_listing is None or data.days_since_listing <= 7)
+        if is_fresh_listing:
+            blocks_long = False
+            short_score = round(short_score * 0.5, 1)
+            if alert_level == 'critical':
+                alert_level = 'warning'
+            reasoning = f'[NEW LISTING] Pumped +{pump:.1f}% | {severity} pump | Launch behavior — short risky'
+        elif blocks_long:
+            reasoning = f'Already pumped +{pump:.1f}% | Risk: {severity} | LONG blocked | Short setup'
+        else:
+            reasoning = f'Already pumped +{pump:.1f}% | Risk: {severity} | Long entry risk elevated'
         confidence = self._calculate_confidence(data, pump)
         return AnalyzerResult(analyzer_name=self.analyzer_name, long_score=long_score, short_score=short_score, confidence=confidence, reasoning=reasoning, blocks_long=blocks_long, blocks_short=False, alert_level=alert_level, key_value=pump, key_label='Pump %')
 
     def _calculate_confidence(self, data: MarketData, pump: float) -> float:
-        confidence = 0.6
-        if data.price_change_4h is not None and data.price_change_24h is not None:
-            confidence += 0.2
-        if pump > 50:
-            confidence += 0.1
+        both = data.price_change_4h is not None and data.price_change_24h is not None
         if pump > 100:
-            confidence += 0.1
-        return min(1.0, confidence)
+            return 1.0 if both else 0.8
+        elif pump > 50:
+            return 0.9 if both else 0.7
+        return 0.8 if both else 0.6

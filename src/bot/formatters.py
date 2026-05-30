@@ -2,6 +2,7 @@ from typing import Optional
 from src.models.signal import Signal
 from src.models.market_data import MarketData
 from src.models.analyzer_result import AnalyzerResult
+from src.models.squeeze_alert import SqueezeAlert
 
 def format_signal_alert(signal: Signal, market_data: MarketData) -> str:
     symbol = _clean_symbol(signal.symbol)
@@ -74,6 +75,68 @@ def format_signal_alert(signal: Signal, market_data: MarketData) -> str:
             lines.append(b)
     return '\n'.join(lines)
 
+def format_squeeze_alert(alert: SqueezeAlert) -> str:
+    symbol = _clean_symbol(alert.symbol)
+    is_long = alert.direction == 'LONG_SQUEEZE'
+    is_strong = alert.alert_level == 'STRONG'
+
+    base_emoji = '⚡' if is_long else '💥'
+    prefix = f'🔥{base_emoji}' if is_strong else base_emoji
+    dir_label = 'LONG SQUEEZE' if is_long else 'SHORT SQUEEZE'
+    header = f'{prefix} {dir_label} ({alert.alert_level}): {symbol}'
+
+    lines = [header, f'Score: {alert.squeeze_score:.1f}/10', '━━━━━━━━━━━━━━━━━━━━━', '']
+    lines.append(f'Price: {_fmt_price(alert.price)}   OI: ${_fmt_large(alert.oi_usd)}')
+    if alert.oi_change_1h is not None:
+        lines.append(f'OI Δ1h: {alert.oi_change_1h:+.1f}%')
+    if alert.price_change_1h is not None:
+        lines.append(f'Price Δ1h: {alert.price_change_1h:+.2f}%')
+    if alert.price_change_4h is not None:
+        lines.append(f'Price Δ4h: {alert.price_change_4h:+.2f}%')
+    lines.append(f'FR: {alert.funding_rate * 100:+.4f}%')
+
+    # Component breakdown
+    lines += ['', 'Components:']
+    c1_label = 'Trapped Shorts' if is_long else 'Trapped Longs'
+    c2_label = 'Ask Vacuum' if is_long else 'Bid Vacuum'
+    c3_label = 'Buy Aggression' if is_long else 'Sell Aggression'
+    c4_label = 'Compression' if is_long else 'Over-Extension'
+    for label, val in [(c1_label, alert.c1_score), (c2_label, alert.c2_score),
+                       (c3_label, alert.c3_score), (c4_label, alert.c4_score)]:
+        if val is not None:
+            lines.append(f'  {label:<18} {val:.1f}')
+    if alert.funding_adj != 0.0:
+        lines.append(f'  FR Adj             {alert.funding_adj:+.2f}')
+
+    # Aggression detail
+    if alert.aggression_5m is not None:
+        side = 'buy' if is_long else 'sell'
+        agg_val = alert.aggression_5m if is_long else (100.0 - alert.aggression_5m)
+        agg_line = f'  Aggression 5m:   {agg_val:.1f}% {side}'
+        if alert.aggression_accel is not None and abs(alert.aggression_accel) >= 1.0:
+            agg_line += f' ({alert.aggression_accel:+.1f}% vs 2h)'
+        lines.append(agg_line)
+
+    # Squeeze-specific context
+    if alert.ob_ratio is not None:
+        ob_label = 'bid/ask' if is_long else 'ask/bid'
+        lines.append(f'  OB {ob_label}:       {alert.ob_ratio:.2f}x')
+    if alert.vci is not None:
+        vci_flag = ' 🔴' if alert.vci < 0.55 else (' 🟡' if alert.vci < 0.65 else '')
+        lines.append(f'  VCI:               {alert.vci:.3f}{vci_flag}')
+    if alert.cfc >= 2:
+        lines.append(f'  Flat candles:      {alert.cfc}')
+
+    lines += ['', alert.reasoning]
+    return '\n'.join(lines)
+
+def _fmt_large(value: float) -> str:
+    if value >= 1_000_000:
+        return f'{value / 1_000_000:.2f}M'
+    if value >= 1_000:
+        return f'{value / 1_000:.1f}K'
+    return f'{value:.0f}'
+
 def format_analysis_result(symbol: str, analysis: dict, market_data: MarketData) -> str:
     symbol_clean = _clean_symbol(symbol)
     long_score = analysis.get('long_score', 0)
@@ -109,6 +172,10 @@ def format_analysis_result(symbol: str, analysis: dict, market_data: MarketData)
             lines.append(f"  5m:  {agg5:.1f}% {('buy' if agg5 >= 50 else 'sell')}")
         if agg2h is not None:
             lines.append(f"  2h:  {agg2h:.1f}% {('buy' if agg2h >= 50 else 'sell')}")
+    regime = analysis.get('regime')
+    regime_reasoning = analysis.get('regime_reasoning', '')
+    if regime:
+        lines.append(f'Regime:  {regime} ({regime_reasoning})')
     results: list[AnalyzerResult] = analysis.get('results', [])
     if results:
         lines.append('')
@@ -135,7 +202,50 @@ def format_watchlist(symbols: list[str]) -> str:
     return '\n'.join(lines)
 
 def format_help() -> str:
-    return 'OI Hunter — сигналы по MEXC фьючерсам\n\nКоманды:\n/analyze SYMBOL — анализ монеты\n/watch SYMBOL   — добавить в watchlist\n/unwatch SYMBOL — убрать из watchlist\n/watchlist      — показать watchlist\n/status         — статус монитора\n/help           — справка\n\nСигналы приходят автоматически при score >= 7.0'
+    return 'OI Hunter — сигналы по MEXC фьючерсам\n\nКоманды:\n/analyze SYMBOL — анализ монеты\n/watch SYMBOL   — добавить в watchlist\n/unwatch SYMBOL — убрать из watchlist\n/watchlist      — показать watchlist\n/stats          — статистика forward-test\n/status         — статус монитора\n/help           — справка\n\nСигналы приходят автоматически при score >= 7.0'
+
+def format_stats(stats: dict) -> str:
+    if 'error' in stats:
+        return f'Ошибка статистики: {stats["error"]}'
+    total = stats.get('total', 0)
+    open_count = stats.get('open', 0)
+    if total == 0:
+        return (
+            'Forward Test\n\n'
+            f'Закрытых сигналов: 0\n'
+            f'Открытых: {open_count}\n\n'
+            'Статистика появится после первых закрытых сделок.'
+        )
+    win_rate = stats.get('win_rate', 0.0)
+    wins = stats.get('wins', 0)
+    losses = stats.get('losses', 0)
+    avg_pnl = stats.get('avg_pnl', 0.0)
+    best = stats.get('best', 0.0)
+    worst = stats.get('worst', 0.0)
+    rate_emoji = '🟢' if win_rate >= 60 else ('🟡' if win_rate >= 40 else '🔴')
+    lines = [
+        '📊 Forward Test',
+        '━━━━━━━━━━━━━━━━━━━━━',
+        f'Закрыто: {total}   Открыто: {open_count}',
+        '',
+        f'{rate_emoji} Win Rate: {win_rate:.1f}%  ({wins}W / {losses}L)',
+        f'Avg PnL:  {avg_pnl:+.2f}%',
+        f'Лучшая:   {best:+.2f}%',
+        f'Худшая:   {worst:+.2f}%',
+        '',
+        'По направлению:',
+        f'  LONG:  {stats.get("long_wins", 0)}/{stats.get("long_total", 0)}'
+        f' ({stats.get("long_win_rate", 0.0):.1f}%)',
+        f'  SHORT: {stats.get("short_wins", 0)}/{stats.get("short_total", 0)}'
+        f' ({stats.get("short_win_rate", 0.0):.1f}%)',
+    ]
+    t1 = stats.get('t1_wins', 0)
+    t2 = stats.get('t2_wins', 0)
+    t3 = stats.get('t3_wins', 0)
+    if wins > 0:
+        lines += ['', f'Тейки: T1={t1}  T2={t2}  T3={t3}']
+    return '\n'.join(lines)
+
 
 def format_status(is_running: bool, tracked_count: int, signals_today: int) -> str:
     emoji = '🟢' if is_running else '🔴'

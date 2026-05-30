@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, Float, String, DateTime, Index
+from sqlalchemy import Column, Integer, Float, String, DateTime, Index, BigInteger, UniqueConstraint, Text
 from sqlalchemy.orm import declarative_base
 Base = declarative_base()
 
@@ -37,7 +37,16 @@ class SignalHistory(Base):
     exit_timestamp = Column(DateTime, nullable=True)
     pnl_percent = Column(Float, nullable=True)
     result = Column(String(20), nullable=True)
+    analyzer_breakdown = Column(Text, nullable=True)
     __table_args__ = (Index('ix_signal_history_symbol_timestamp', 'symbol', 'timestamp'),)
 
     def __repr__(self):
         return f'<Signal({self.direction} {self.symbol} score={self.score:.1f})>'
+
+class UserWatchlist(Base):
+    __tablename__ = 'user_watchlists'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(BigInteger, nullable=False, index=True)
+    symbol = Column(String(32), nullable=False)
+    added_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint('chat_id', 'symbol', name='uq_watchlist_chat_symbol'),)

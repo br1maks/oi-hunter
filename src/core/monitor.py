@@ -3,15 +3,17 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime, timezone
-from typing import List, Dict, Optional, Set
+from datetime import datetime
+from typing import List, Optional, Set
 from ..api.mexc_client import MEXCRestClient
 from ..data.data_aggregator import DataAggregator
 from ..data.market_cap_cache import MarketCapCache
 from ..database import DatabaseManager, get_database
 from .batch_scanner import BatchScanner, TokenSnapshot
+from .forward_tester import ForwardTester
 from .signal_generator import SignalGenerator
 from .oi_tracker import OITracker
+from ..analyzers.squeeze_detector import SqueezeDetector
 logger = logging.getLogger(__name__)
 
 class Monitor:
@@ -20,6 +22,8 @@ class Monitor:
     DEFAULT_TOP_N = 50
     ALERT_THRESHOLD = 7.0
     MIN_ALERT_OI_USD = 180000
+    MIN_ALERT_VOLUME_24H = 250_000
+    MAX_SQUEEZE_ALERTS_PER_CYCLE = 3
 
     def __init__(self, interval_seconds: int=DEFAULT_INTERVAL, top_n: int=DEFAULT_TOP_N, alert_threshold: float=ALERT_THRESHOLD, db: Optional[DatabaseManager]=None, alerter=None):
         self._interval = interval_seconds
@@ -34,9 +38,12 @@ class Monitor:
         self._tracker: Optional[OITracker] = None
         self._mc_cache: Optional[MarketCapCache] = None
         self._client: Optional[MEXCRestClient] = None
+        self._forward_tester: Optional[ForwardTester] = None
+        self._squeeze_detector: Optional[SqueezeDetector] = None
         self._running = False
         self._cycle_count = 0
         self._alerts_generated = 0
+        self._squeeze_alerts_generated = 0
         self._start_time: Optional[float] = None
         self._setup_signal_handlers()
 
@@ -73,12 +80,16 @@ class Monitor:
                 print('  Loading market caps from CoinGecko...')
                 loaded = await mc_cache.refresh(max_pages=4)
                 print(f'  Loaded {loaded} market caps\n')
+                if self._alerter and hasattr(self._alerter, '_bot'):
+                    self._alerter._bot.set_market_cap_cache(mc_cache)
                 async with DataAggregator(client, mc_cache) as aggregator:
                     self._aggregator = aggregator
                     self._generator = SignalGenerator()
-                    self._scanner = BatchScanner(client, mc_cache)
                     self._tracker = OITracker(self._db, self._top_n)
+                    self._squeeze_detector = SqueezeDetector()
+                    self._scanner = BatchScanner(client, mc_cache, oi_tracker=self._tracker, squeeze_detector=self._squeeze_detector)
                     self._generator.set_database(self._db)
+                    self._forward_tester = ForwardTester(self._db)
                     if single_symbol:
                         await self._run_single_symbol_mode(single_symbol)
                     else:
@@ -102,11 +113,17 @@ class Monitor:
                 snapshots = await self._scanner.scan_all(self._aggregator, self._generator, incremental=self._cycle_count > 1)
                 print()
                 await self._record_oi_snapshots(snapshots)
+                closed = self._forward_tester.update_outcomes(snapshots)
+                if closed:
+                    print(f'  [FT] Closed {closed} signal outcome(s)')
                 alerts = self._check_alerts(snapshots)
                 if alerts:
                     self._display_alerts(alerts)
                     if self._alerter:
                         await self._send_telegram_alerts(alerts)
+                squeeze_candidates = self._check_squeeze_alerts(snapshots)
+                if squeeze_candidates and self._alerter:
+                    await self._send_telegram_squeeze_alerts(squeeze_candidates)
                 self._display_watchlist(snapshots)
                 self._display_cycle_stats(cycle_start)
                 if self._cycle_count % 10 == 0:
@@ -163,15 +180,30 @@ class Monitor:
         return market_data
 
     async def _record_oi_snapshots(self, snapshots: List[TokenSnapshot]):
-        snapshot_dicts = []
+        MIN_OI_USD = 50_000
+        from datetime import timezone
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        records = []
+        anomaly_list = []
         for snap in snapshots:
-            anomaly_score = max(snap.long_score, snap.short_score)
-            oi_usd = snap.open_interest_usd
-            if oi_usd <= 0:
+            if snap.open_interest_usd < MIN_OI_USD:
                 continue
-            snapshot_dicts.append({'symbol': snap.symbol, 'oi_usd': oi_usd, 'price': snap.price, 'volume_24h': snap.volume_24h, 'anomaly_score': anomaly_score})
-        saved = self._tracker.record_snapshots(snapshot_dicts, sort_key='anomaly_score')
-        print(f'  [DB] Recorded {saved} OI snapshots')
+            anomaly = max(snap.long_score, snap.short_score)
+            records.append({
+                'symbol': snap.symbol,
+                'oi_usd': snap.open_interest_usd,
+                'price': snap.price,
+                'volume_24h': snap.volume_24h,
+                'timestamp': now,
+            })
+            anomaly_list.append((snap.symbol, anomaly))
+        if records:
+            saved = self._tracker._repo.save_snapshots_batch(records)
+            top = sorted(anomaly_list, key=lambda x: x[1], reverse=True)[:self._top_n]
+            self._tracker._current_watchlist = {sym for sym, _ in top}
+            print(f'  [DB] Recorded {saved} OI snapshots ({len(records)} symbols tracked)')
+        else:
+            print(f'  [DB] No OI snapshots to record')
 
     async def _send_telegram_alerts(self, alerts: List[TokenSnapshot]):
         from ..analyzers.oi_nowcast_analyzer import normalize_symbol
@@ -180,16 +212,21 @@ class Monitor:
             if snap.symbol in self._dead_symbols:
                 continue
             if self._alerter.is_on_cooldown(snap.symbol):
+                logger.info(f'[TG] {snap.symbol} on cooldown, skipping')
                 continue
             try:
                 market_data = await self._aggregator.aggregate(snap.symbol)
                 if market_data is None:
+                    logger.warning(f'[TG] {snap.symbol} → aggregate() returned None, skipping')
                     continue
                 db_symbol = normalize_symbol(snap.symbol)
                 market_data = self._enrich_oi_changes(market_data, db_symbol)
                 signal = self._generator.generate(market_data)
                 if signal:
                     await self._alerter.send_signal_alert(signal, market_data)
+                    self._forward_tester.record_signal(signal, market_data)
+                else:
+                    logger.info(f'[TG] {snap.symbol} scan_score={max(snap.long_score, snap.short_score):.1f} → generate() returned None (see [Signal] log above)')
             except MEXCNotFoundException as e:
                 logger.warning(f'Symbol unavailable, skipping permanently: {snap.symbol} ({e})')
                 self._dead_symbols.add(snap.symbol)
@@ -206,9 +243,80 @@ class Monitor:
                 continue
             if 0 < snap.open_interest_usd < self.MIN_ALERT_OI_USD:
                 continue
+            if 0 < snap.volume_24h < self.MIN_ALERT_VOLUME_24H:
+                continue
             if snap.long_score >= self._alert_threshold or snap.short_score >= self._alert_threshold:
                 alerts.append(snap)
         return alerts
+
+    def _check_squeeze_alerts(self, snapshots: List[TokenSnapshot]) -> List[TokenSnapshot]:
+        if self._squeeze_detector is None:
+            return []
+        fresh = self._scanner.fresh_symbols
+        candidates = []
+        for snap in snapshots:
+            if snap.symbol not in fresh:
+                continue
+            if 0 < snap.open_interest_usd < self.MIN_ALERT_OI_USD:
+                continue
+            if 0 < snap.volume_24h < self.MIN_ALERT_VOLUME_24H:
+                continue
+            if max(snap.squeeze_long, snap.squeeze_short) >= SqueezeDetector.ALERT_THRESHOLD_WATCH:
+                candidates.append(snap)
+        return candidates
+
+    async def _send_telegram_squeeze_alerts(self, candidates: List[TokenSnapshot]):
+        from ..analyzers.oi_nowcast_analyzer import normalize_symbol
+        from ..api.exceptions import MEXCNotFoundException, MEXCRateLimitException
+        candidates = sorted(candidates, key=lambda s: max(s.squeeze_long, s.squeeze_short), reverse=True)
+        sent_strong = 0
+        for snap in candidates:
+            if snap.symbol in self._dead_symbols:
+                continue
+            if self._squeeze_detector._is_on_cooldown(snap.symbol):
+                logger.info(f'[Squeeze] {snap.symbol} on cooldown, skipping')
+                continue
+            try:
+                market_data = await self._aggregator.aggregate(snap.symbol)
+                if market_data is None:
+                    logger.warning(f'[Squeeze] {snap.symbol} → aggregate() returned None, skipping')
+                    continue
+                db_symbol = normalize_symbol(snap.symbol)
+                market_data = self._enrich_oi_changes(market_data, db_symbol)
+                scores = self._squeeze_detector.detect(market_data, update_history=False)
+                result = self._squeeze_detector.should_alert(snap.symbol, scores)
+                if result is None:
+                    logger.info(
+                        f'[Squeeze] {snap.symbol} → no alert '
+                        f'(score dropped or C1/C2 both missing)'
+                    )
+                    continue
+                direction, level = result
+                if level == 'WATCH':
+                    logger.info(
+                        f'[Squeeze WATCH] {snap.symbol} → {direction} '
+                        f'L={scores.long_score:.1f} S={scores.short_score:.1f} '
+                        f'(logged, awaiting STRONG confirmation)'
+                    )
+                    continue
+                if sent_strong >= self.MAX_SQUEEZE_ALERTS_PER_CYCLE:
+                    logger.info(f'[Squeeze] cycle cap reached ({self.MAX_SQUEEZE_ALERTS_PER_CYCLE}), skipping {snap.symbol}')
+                    continue
+                alert = self._squeeze_detector.build_alert(market_data, direction, scores)
+                await self._alerter.send_squeeze_alert(alert)
+                self._squeeze_alerts_generated += 1
+                sent_strong += 1
+                logger.info(
+                    f'[Squeeze STRONG] {snap.symbol} → {direction} '
+                    f'{alert.squeeze_score:.1f}/10 → Telegram ({sent_strong}/{self.MAX_SQUEEZE_ALERTS_PER_CYCLE})'
+                )
+            except MEXCNotFoundException as e:
+                logger.warning(f'Symbol unavailable: {snap.symbol} ({e})')
+                self._dead_symbols.add(snap.symbol)
+            except MEXCRateLimitException:
+                logger.warning(f'Rate limit hit for {snap.symbol}, will retry next cycle')
+            except Exception as e:
+                logger.error(f'Failed to send squeeze alert for {snap.symbol}: {e}')
 
     def _display_alerts(self, alerts: List[TokenSnapshot]):
         print('\n' + '!' * 70)
@@ -225,20 +333,34 @@ class Monitor:
         print('\n' + '!' * 70)
 
     def _display_watchlist(self, snapshots: List[TokenSnapshot]):
-        top = self._scanner.get_top_candidates(snapshots, min_score=4.0, limit=10)
-        if not top:
-            print('\n  [WATCHLIST] No tokens with score >= 4.0')
-            return
+        fresh = self._scanner.fresh_symbols
+        # Split into fresh (rescanned this cycle) and stale (carried-over score)
+        fresh_snaps = [s for s in snapshots if s.symbol in fresh]
+        stale_snaps = [s for s in snapshots if s.symbol not in fresh]
+
+        top_fresh = self._scanner.get_top_candidates(fresh_snaps, min_score=4.0, limit=10)
+        top_stale = self._scanner.get_top_candidates(stale_snaps, min_score=5.5, limit=5)
+
         print('\n' + '-' * 70)
-        print('  WATCHLIST (Top 10)')
+        print(f'  WATCHLIST — Fresh this cycle ({len(fresh_snaps)} rescanned)')
         print('-' * 70)
-        print(f"  {'Symbol':<15} {'Long':>8} {'Short':>8} {'Price':>12} {'Direction':<8}")
-        print('  ' + '-' * 55)
-        for snap in top:
-            direction = 'LONG' if snap.long_score > snap.short_score else 'SHORT'
-            if snap.long_score == snap.short_score:
-                direction = 'NEUTRAL'
-            print(f'  {snap.symbol:<15} {snap.long_score:>8.1f} {snap.short_score:>8.1f} ${snap.price:>10.4f} {direction:<8}')
+        if top_fresh:
+            print(f"  {'Symbol':<15} {'Long':>8} {'Short':>8} {'Price':>12} {'Direction':<8}")
+            print('  ' + '-' * 55)
+            for snap in top_fresh:
+                direction = 'LONG' if snap.long_score > snap.short_score else 'SHORT'
+                if snap.long_score == snap.short_score:
+                    direction = 'NEUTRAL'
+                print(f'  {snap.symbol:<15} {snap.long_score:>8.1f} {snap.short_score:>8.1f} ${snap.price:>10.4f} {direction:<8}')
+        else:
+            print('  No fresh tokens with score >= 4.0 this cycle')
+
+        if top_stale:
+            print(f'\n  Holding (unchanged >= 5.5):')
+            for snap in top_stale:
+                direction = 'LONG' if snap.long_score > snap.short_score else 'SHORT'
+                print(f'  {snap.symbol:<15} {snap.long_score:>8.1f} {snap.short_score:>8.1f} ${snap.price:>10.4f} {direction:<8} [stale]')
+
         watchlist = self._tracker.watchlist
         print(f'\n  [OI TRACKING] {len(watchlist)} tokens in database')
 
@@ -290,6 +412,7 @@ class Monitor:
         print(f'  Uptime:         {uptime / 60:.1f} min')
         print(f'  Cycles:         {self._cycle_count}')
         print(f'  Alerts:         {self._alerts_generated}')
+        print(f'  Squeeze Alerts: {self._squeeze_alerts_generated}')
         print(f"  Tokens Scanned: {scanner_stats['total_tokens']}")
         print(f"  Tokens Changed: {scanner_stats['tokens_changed']}")
         print(f"  DB Records:     {tracker_stats['total_records']}")

@@ -5,6 +5,8 @@ from ..models.analyzer_result import AnalyzerResult
 
 class AggressionAnalyzer(BaseAnalyzer):
     SHIFT_THRESHOLD = 15.0
+    MIN_5M_TRADES = 20   # minimum independent trades for a reliable 5m aggression reading
+    MIN_2H_TRADES = 50   # minimum independent trades for the primary 2h aggression reading
 
     def __init__(self, weight: float=1.5):
         super().__init__(weight=weight)
@@ -17,6 +19,13 @@ class AggressionAnalyzer(BaseAnalyzer):
         if not super()._validate_data(data):
             return False
         if data.aggression_2h is None:
+            return False
+        if not (0.0 <= data.aggression_2h <= 100.0):
+            return False
+        # Require minimum trade count for a statistically reliable 2h reading.
+        # On thin tokens with futures fallback, 10-30 deals over 2h can show
+        # 100% buy aggression by chance — not enough independent data points.
+        if data.trade_count_2h is None or data.trade_count_2h < self.MIN_2H_TRADES:
             return False
         return True
 
@@ -53,6 +62,8 @@ class AggressionAnalyzer(BaseAnalyzer):
             modifier = 4.0
         elif abs_diff >= 25:
             modifier = 3.0
+        elif abs_diff >= 20:
+            modifier = 2.0
         else:
             modifier = 1.5
         if diff < 0:
@@ -65,9 +76,16 @@ class AggressionAnalyzer(BaseAnalyzer):
             return None
         agg_2h = data.aggression_2h
         long_score, long_interp = self._score_aggression(agg_2h)
-        short_score, short_interp = self._score_aggression(100.0 - agg_2h)
+        short_score, _ = self._score_aggression(100.0 - agg_2h)
         reasoning_parts = [f'2H Aggression: {agg_2h:.1f}% - {long_interp}']
-        if data.aggression_5m is not None:
+        # Require minimum trade count before trusting the 5m aggression reading.
+        # 2-3 trades can give 100% aggression by chance — statistically meaningless.
+        has_reliable_5m = (
+            data.aggression_5m is not None
+            and data.trade_count_5m is not None
+            and data.trade_count_5m >= self.MIN_5M_TRADES
+        )
+        if has_reliable_5m:
             shift = self._detect_shift(agg_2h, data.aggression_5m)
             if shift['shift_detected']:
                 long_score = max(0.0, min(10.0, long_score + shift['long_modifier']))
@@ -75,11 +93,23 @@ class AggressionAnalyzer(BaseAnalyzer):
                 reasoning_parts.append(f"5M: {data.aggression_5m:.1f}% | SHIFT {shift['direction']} ({shift['magnitude']:.1f}pp) → long {shift['long_modifier']:+.1f}, short {shift['short_modifier']:+.1f}")
             else:
                 reasoning_parts.append(f'5M: {data.aggression_5m:.1f}% | No significant shift')
-        blocks_long = agg_2h < 25.0
-        blocks_short = agg_2h > 75.0
+            # Extreme 5m reading anchors the score from below regardless of 2h history.
+            # A sudden spike to 80%+ buying shouldn't be fully suppressed by a weak 2h base.
+            if data.aggression_5m >= 70 or data.aggression_5m <= 30:
+                score_5m, _ = self._score_aggression(data.aggression_5m)
+                score_5m_short, _ = self._score_aggression(100.0 - data.aggression_5m)
+                new_long = max(long_score, score_5m * 0.75)
+                new_short = max(short_score, score_5m_short * 0.75)
+                if new_long > long_score + 0.5:
+                    reasoning_parts.append(f'5M floor: long {long_score:.1f}->{new_long:.1f} (5M={data.aggression_5m:.0f}%)')
+                if new_short > short_score + 0.5:
+                    reasoning_parts.append(f'5M floor: short {short_score:.1f}->{new_short:.1f} (5M={data.aggression_5m:.0f}%)')
+                long_score, short_score = new_long, new_short
+        blocks_long = agg_2h < 30.0
+        blocks_short = agg_2h > 70.0
         if agg_2h >= 85 or agg_2h <= 15:
             alert_level = 'critical'
-        elif agg_2h >= 75 or agg_2h <= 25:
+        elif agg_2h >= 70 or agg_2h <= 30:
             alert_level = 'warning'
         else:
             alert_level = 'info'
@@ -89,8 +119,15 @@ class AggressionAnalyzer(BaseAnalyzer):
 
     def _calculate_confidence(self, data: MarketData) -> float:
         confidence = 0.7
-        if data.aggression_5m is not None:
-            confidence = 0.85
+        has_reliable_5m = (
+            data.aggression_5m is not None
+            and data.trade_count_5m is not None
+            and data.trade_count_5m >= self.MIN_5M_TRADES
+        )
+        if has_reliable_5m:
+            confidence += 0.15
         if data.volume_24h and data.volume_24h > 1000000:
             confidence = min(1.0, confidence + 0.1)
+        if data.aggression_2h >= 85 or data.aggression_2h <= 15:
+            confidence = min(1.0, confidence + 0.05)
         return confidence

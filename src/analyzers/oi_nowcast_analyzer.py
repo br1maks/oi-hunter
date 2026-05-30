@@ -1,8 +1,11 @@
+import logging
 from typing import Optional, List, Tuple
 from datetime import datetime
 from ..models.market_data import MarketData
 from ..models.analyzer_result import AnalyzerResult
 from .base import BaseAnalyzer
+
+logger = logging.getLogger(__name__)
 
 def normalize_symbol(symbol: str) -> str:
     if '_' in symbol:
@@ -62,7 +65,12 @@ class OINowcastAnalyzer(BaseAnalyzer):
         recent_half = oi_history[mid:]
         velocity_older = self._calculate_velocity(older_half)
         velocity_recent = self._calculate_velocity(recent_half)
-        return velocity_recent - velocity_older
+        older_mid = older_half[len(older_half) // 2][0]
+        recent_mid = recent_half[len(recent_half) // 2][0]
+        dt = (recent_mid - older_mid).total_seconds() / 60
+        if dt < 1e-10:
+            return 0.0
+        return (velocity_recent - velocity_older) / dt
 
     def _predict_oi(self, current_oi: float, velocity: float, acceleration: float, minutes_ahead: int) -> dict:
         t = minutes_ahead
@@ -73,7 +81,7 @@ class OINowcastAnalyzer(BaseAnalyzer):
         else:
             change_pct = 0.0
         if abs(velocity) > 0:
-            stability = 1.0 - min(1.0, abs(acceleration) / (abs(velocity) + 1e-10))
+            stability = 1.0 - min(1.0, 0.5 * abs(acceleration) * t / (abs(velocity) + 1e-10))
             confidence = 0.5 + stability * 0.5
         else:
             confidence = 0.5
@@ -105,9 +113,9 @@ class OINowcastAnalyzer(BaseAnalyzer):
             return 'SURGING'
         elif pct > 2:
             return 'GROWING'
-        elif pct >= -2:
+        elif pct > -2:
             return 'STABLE'
-        elif pct >= -5:
+        elif pct > -5:
             return 'WEAKENING'
         else:
             return 'COLLAPSING'
@@ -132,6 +140,16 @@ class OINowcastAnalyzer(BaseAnalyzer):
             return (0.0, 3.0, 'REVERSAL SIGNAL!')
         if transition == ('WEAKENING', 'COLLAPSING'):
             return (0.0, 1.5, 'STRONG SELLOFF')
+        if transition == ('WEAKENING', 'SURGING'):
+            return (2.0, 0.0, 'REBOUND')
+        if transition == ('COLLAPSING', 'SURGING'):
+            return (2.5, 0.0, 'STRONG REBOUND')
+        if transition == ('SURGING', 'GROWING'):
+            return (0.0, 1.0, 'DECELERATING')
+        if transition in [('SURGING', 'STABLE'), ('OVERHEATED', 'STABLE')]:
+            return (0.0, 2.0, 'MOMENTUM STALL')
+        if transition == ('OVERHEATED', 'GROWING'):
+            return (0.0, 1.5, 'COOLING')
         return (0.0, 0.0, '')
 
     def analyze(self, data: MarketData) -> Optional[AnalyzerResult]:
@@ -142,14 +160,24 @@ class OINowcastAnalyzer(BaseAnalyzer):
             return None
         try:
             oi_history = self._oi_repo.get_history(symbol, minutes=30)
-        except Exception:
+        except Exception as e:
+            logger.warning(f'OI Nowcast DB error for {symbol}: {e}')
             return None
         num_points = len(oi_history)
         if num_points < self.MIN_POINTS_BASIC:
             return AnalyzerResult(analyzer_name=self.analyzer_name, long_score=5.0, short_score=5.0, confidence=0.3, reasoning=f'Warming up: {num_points}/{self.MIN_POINTS_BASIC} data points', key_value=float(num_points), key_label='Data Points')
         current_oi = oi_history[-1][1]
+        if current_oi <= 0:
+            return None
         velocity = self._calculate_velocity(oi_history)
         acceleration = self._calculate_acceleration(oi_history)
+        # Guard: suspicious OI collapse — large OI drop without price movement.
+        # Causes: delta-neutral exit (whale closed both long+short) or API artifact.
+        # The subsequent OI "rebound" is from an artificially low base, not real accumulation.
+        suspicious_collapse = (
+            data.oi_change_1h is not None and data.oi_change_1h < -25.0
+            and data.price_change_1h is not None and abs(data.price_change_1h) < 3.0
+        )
         predictions = {}
         for minutes in [5, 10, 15]:
             predictions[f'{minutes}min'] = self._predict_oi(current_oi, velocity, acceleration, minutes)
@@ -165,12 +193,24 @@ class OINowcastAnalyzer(BaseAnalyzer):
             prev_phase = entry[1]
         current_phase = self._classify_phase(pred_10min['predicted_change_pct'], acceleration, prev_phase)
         long_bonus, short_bonus, transition_label = self._get_phase_transition_bonus(prev_phase, current_phase)
+        if suspicious_collapse and long_bonus > 0:
+            long_bonus *= 0.5
         long_score = min(10.0, long_score + long_bonus)
         short_score = min(10.0, short_score + short_bonus)
+        # Price-OI direction check: OI growing while price falling = shorts entering,
+        # not longs accumulating. Reduce long score proportionally.
+        price_dir_note = ''
+        if data.price_change_1h is not None and velocity > 0:
+            price_drop = -data.price_change_1h
+            if price_drop > 1.0:
+                penalty = min(4.0, price_drop * 0.8)
+                long_score = max(1.0, long_score - penalty)
+                short_score = min(10.0, short_score + penalty * 0.5)
+                price_dir_note = f' [price↓{data.price_change_1h:+.1f}%→shorts]'
         OINowcastAnalyzer._phase_cache[symbol] = (prev_phase, current_phase, cycle_id)
         blocks_long = pred_10min['predicted_change_pct'] <= -5
         blocks_short = pred_10min['predicted_change_pct'] >= 10
-        if short_bonus > 0:
+        if short_bonus > 0 or price_dir_note:
             blocks_short = False
         if pred_10min['predicted_change_pct'] <= -10:
             alert_level = 'critical'
@@ -183,7 +223,11 @@ class OINowcastAnalyzer(BaseAnalyzer):
             base_confidence *= 0.8
         elif num_points >= self.MIN_POINTS_RELIABLE:
             base_confidence = min(1.0, base_confidence * 1.1)
+        if suspicious_collapse:
+            base_confidence *= 0.5
+        base_confidence = max(0.3, base_confidence)
         velocity_dir = '+' if velocity > 0 else ''
+        velocity_pct = velocity / current_oi * 100
         accel_status = ''
         if num_points < self.MIN_POINTS_ACCEL:
             accel_status = ' (accel: insufficient data)'
@@ -195,8 +239,11 @@ class OINowcastAnalyzer(BaseAnalyzer):
         if prev_phase is not None and prev_phase != current_phase:
             phase_prefix = f'[{prev_phase}->{current_phase}]'
             if transition_label:
-                phase_prefix += f' {transition_label} |'
+                phase_prefix += f' {transition_label}'
+            phase_prefix += ' |'
         else:
             phase_prefix = f'[{current_phase}]'
-        reasoning = f"{phase_prefix} {interpretation} | Velocity: {velocity_dir}{velocity:,.0f} USD/min{accel_status} | 5m: {_fmt_pct(predictions['5min']['predicted_change_pct'])}, 10m: {_fmt_pct(predictions['10min']['predicted_change_pct'])}, 15m: {_fmt_pct(predictions['15min']['predicted_change_pct'])}"
+        collapse_note = (f' | SUSPICIOUS: OI {data.oi_change_1h:.0f}% collapse without price move (confidence*0.5)'
+                         if suspicious_collapse else '')
+        reasoning = f"{phase_prefix} {interpretation} | Velocity: {velocity_dir}{velocity:,.0f} USD/min ({velocity_pct:+.3f}%/min){accel_status} | 5m: {_fmt_pct(predictions['5min']['predicted_change_pct'])}, 10m: {_fmt_pct(predictions['10min']['predicted_change_pct'])}, 15m: {_fmt_pct(predictions['15min']['predicted_change_pct'])}{price_dir_note}{collapse_note}"
         return AnalyzerResult(analyzer_name=self.analyzer_name, long_score=long_score, short_score=short_score, confidence=base_confidence, reasoning=reasoning, key_value=pred_10min['predicted_change_pct'], key_label='Predicted OI 10m %', blocks_long=blocks_long, blocks_short=blocks_short, alert_level=alert_level)

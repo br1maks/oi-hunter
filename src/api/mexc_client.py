@@ -16,6 +16,7 @@ class MEXCRestClient:
         self._client: Optional[httpx.AsyncClient] = None
         self._request_timestamps: deque = deque(maxlen=MEXCConfig.RATE_LIMIT_REQUESTS_PER_SECOND * 60)
         self._weight_timestamps: deque = deque(maxlen=MEXCConfig.RATE_LIMIT_WEIGHT_PER_MINUTE)
+        self._contract_size_cache: Dict[str, float] = {}
 
     async def __aenter__(self):
         self._client = httpx.AsyncClient(timeout=self.timeout)
@@ -106,11 +107,15 @@ class MEXCRestClient:
         normalized_symbol = MEXCConfig.futures_symbol_format(symbol)
         if not normalized_symbol:
             raise MEXCInvalidSymbolException(f'Invalid symbol: {symbol}')
-        detail_url = f'{MEXCConfig.FUTURES_BASE_URL}/api/v1/contract/detail'
-        detail_response = await self._request('GET', detail_url, {'symbol': normalized_symbol})
-        if not detail_response.get('success'):
-            raise MEXCNotFoundException(f'Contract details not found: {normalized_symbol}', status_code=404, response=detail_response)
-        contract_size = float(detail_response.get('data', {}).get('contractSize', 0.0001))
+        if normalized_symbol in self._contract_size_cache:
+            contract_size = self._contract_size_cache[normalized_symbol]
+        else:
+            detail_url = f'{MEXCConfig.FUTURES_BASE_URL}/api/v1/contract/detail'
+            detail_response = await self._request('GET', detail_url, {'symbol': normalized_symbol})
+            if not detail_response.get('success'):
+                raise MEXCNotFoundException(f'Contract details not found: {normalized_symbol}', status_code=404, response=detail_response)
+            contract_size = float(detail_response.get('data', {}).get('contractSize', 0.0001))
+            self._contract_size_cache[normalized_symbol] = contract_size
         ticker_url = f'{MEXCConfig.FUTURES_BASE_URL}/api/v1/contract/ticker'
         ticker_response = await self._request('GET', ticker_url, {'symbol': normalized_symbol})
         if not ticker_response.get('success'):
@@ -119,7 +124,7 @@ class MEXCRestClient:
         hold_vol = float(data.get('holdVol', 0))
         last_price = float(data.get('lastPrice', 0))
         open_interest_value = hold_vol * contract_size * last_price
-        return {'symbol': normalized_symbol, 'openInterest': str(hold_vol), 'openInterestValue': str(open_interest_value), 'contractSize': str(contract_size), 'lastPrice': str(last_price), 'timestamp': data.get('timestamp', 0)}
+        return {'symbol': normalized_symbol, 'openInterest': str(hold_vol), 'openInterestValue': str(open_interest_value), 'contractSize': str(contract_size), 'lastPrice': str(last_price), 'timestamp': data.get('timestamp', 0), 'amount24': str(data.get('amount24') or 0)}
 
     async def get_funding_rate(self, symbol: str) -> Dict[str, Any]:
         normalized_symbol = MEXCConfig.futures_symbol_format(symbol)
@@ -142,7 +147,7 @@ class MEXCRestClient:
         limit = min(max(1, limit), 1000)
         url = f'{MEXCConfig.SPOT_BASE_URL}{MEXCConfig.SPOT_TRADES}'
         params = {'symbol': normalized_symbol, 'limit': limit}
-        return await self._request('GET', url, params, weight=5)
+        return await self._request('GET', url, params)
 
     async def get_klines(self, symbol: str, interval: str='5m', limit: int=100) -> list[list]:
         normalized_symbol = MEXCConfig.spot_symbol_format(symbol)
@@ -153,4 +158,104 @@ class MEXCRestClient:
         limit = min(max(1, limit), 1000)
         url = f'{MEXCConfig.SPOT_BASE_URL}{MEXCConfig.SPOT_KLINES}'
         params = {'symbol': normalized_symbol, 'interval': normalized_interval, 'limit': limit}
-        return await self._request('GET', url, params, weight=5)
+        return await self._request('GET', url, params)
+
+    async def get_futures_klines(self, symbol: str, interval: str = '1h', limit: int = 100) -> list[list]:
+        normalized_symbol = MEXCConfig.futures_symbol_format(symbol)
+        if not normalized_symbol:
+            raise MEXCInvalidSymbolException(f'Invalid symbol: {symbol}')
+        interval_map = {'1h': 'Min60', '5m': 'Min5', '15m': 'Min15', '4h': 'Min240', '1d': 'Day1'}
+        futures_interval = interval_map.get(interval, 'Min60')
+        limit = min(max(1, limit), 2000)
+        url = f'{MEXCConfig.FUTURES_BASE_URL}{MEXCConfig.FUTURES_KLINES}/{normalized_symbol}'
+        params = {'interval': futures_interval, 'limit': limit}
+        response = await self._request('GET', url, params)
+        if not response.get('success'):
+            return []
+        data = response.get('data', {})
+        if not data or 'time' not in data:
+            return []
+        return self._normalize_futures_klines(data)
+
+    @staticmethod
+    def _normalize_futures_klines(data: dict) -> list[list]:
+        """Convert futures klines dict-of-arrays to spot-compatible list-of-lists.
+
+        Spot format: [timestamp_ms, open, high, low, close, base_vol, close_time_ms, quote_vol]
+        Futures source: {time:[...seconds], open:[...], high:[...], low:[...],
+                         close:[...], vol:[...contracts], amount:[...usdt]}
+        """
+        times   = data.get('time', [])
+        opens   = data.get('open', [])
+        highs   = data.get('high', [])
+        lows    = data.get('low', [])
+        closes  = data.get('close', [])
+        vols    = data.get('vol', [])
+        amounts = data.get('amount', [])
+        result = []
+        n = len(times)
+        for i in range(n):
+            try:
+                ts_ms = int(times[i]) * 1000  # seconds → milliseconds
+                c = closes[i] if i < len(closes) else '0'
+                v = vols[i] if i < len(vols) else '0'
+                if i < len(amounts) and amounts[i]:
+                    quote_vol = str(amounts[i])
+                else:
+                    quote_vol = str(float(v or 0) * float(c or 0))
+                result.append([
+                    ts_ms,
+                    opens[i] if i < len(opens) else '0',
+                    highs[i] if i < len(highs) else '0',
+                    lows[i]  if i < len(lows)  else '0',
+                    c,
+                    v,
+                    ts_ms + 3_600_000,
+                    quote_vol,
+                ])
+            except (TypeError, ValueError, IndexError):
+                continue
+        return result
+
+    async def get_futures_deals(self, symbol: str, limit: int = 1000) -> list[dict]:
+        """Fetch futures recent deals and normalize to spot trades format.
+
+        Spot trades format: {isBuyerMaker: bool, quoteQty: str, time: int}
+        Futures deals: {T: 1|0, v: contracts, p: price, t: timestamp_ms}
+        T=1 → taker was buyer (isBuyerMaker=False), T=0 → taker was seller (isBuyerMaker=True)
+        """
+        normalized_symbol = MEXCConfig.futures_symbol_format(symbol)
+        if not normalized_symbol:
+            raise MEXCInvalidSymbolException(f'Invalid symbol: {symbol}')
+        limit = min(max(1, limit), 2000)
+        url = f'{MEXCConfig.FUTURES_BASE_URL}{MEXCConfig.FUTURES_DEALS}/{normalized_symbol}'
+        params = {'limit': limit}
+        response = await self._request('GET', url, params)
+        if not response.get('success'):
+            return []
+        deals = response.get('data', [])
+        if not isinstance(deals, list):
+            return []
+        contract_size = self._contract_size_cache.get(normalized_symbol, 1.0)
+        result = []
+        for d in deals:
+            try:
+                price = float(d.get('p', 0) or 0)
+                vol_contracts = float(d.get('v', 0) or 0)
+                quote_qty = price * vol_contracts * contract_size
+                result.append({
+                    'isBuyerMaker': d.get('T', 1) == 0,  # T=1 buy → isBuyerMaker=False
+                    'quoteQty': str(quote_qty),
+                    'time': int(d.get('t', 0) or 0),
+                })
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    async def get_order_book(self, symbol: str, limit: int = 20) -> Dict[str, Any]:
+        normalized_symbol = MEXCConfig.futures_symbol_format(symbol)
+        if not normalized_symbol:
+            raise MEXCInvalidSymbolException(f'Invalid symbol: {symbol}')
+        url = f'{MEXCConfig.FUTURES_BASE_URL}/api/v1/contract/depth'
+        params = {'symbol': normalized_symbol, 'limit': min(limit, 100)}
+        return await self._request('GET', url, params)

@@ -1,16 +1,16 @@
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
 from typing import List, Dict, Optional, Set, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 from ..api.mexc_client import MEXCRestClient
 from ..api.config import MEXCConfig
 from ..data.data_aggregator import DataAggregator
 from ..data.market_cap_cache import MarketCapCache
-from ..models.market_data import MarketData
 from .signal_generator import SignalGenerator
+from ..analyzers.oi_nowcast_analyzer import normalize_symbol
+from ..analyzers.squeeze_detector import SqueezeDetector
 
 @dataclass
 class TokenSnapshot:
@@ -23,6 +23,8 @@ class TokenSnapshot:
     short_score: float
     open_interest_usd: float = 0.0
     funding_rate: float = 0.0
+    squeeze_long: float = 0.0
+    squeeze_short: float = 0.0
 
     def has_changed(self, current: 'TokenSnapshot', threshold: Dict[str, float]) -> bool:
         if self.price > 0:
@@ -44,14 +46,35 @@ class TokenSnapshot:
 
 class BatchScanner:
     DEFAULT_THRESHOLDS = {'price': 0.03, 'oi': 0.05, 'volume': 0.5, 'funding': 0.0005}
-    BATCH_SIZE = 20
-    SNAPSHOT_BATCH = 20
-    FORCE_RESCAN_SCORE = 6.5
+    BATCH_SIZE = 50
+    SNAPSHOT_BATCH = 50
+    FORCE_RESCAN_SCORE = 5.5
+    FORCE_RESCAN_SQUEEZE_SCORE = 5.0
 
-    def __init__(self, mexc_client: Optional[MEXCRestClient]=None, mc_cache: Optional[MarketCapCache]=None, change_thresholds: Optional[Dict[str, float]]=None):
+    # Non-crypto futures on MEXC (stocks, commodities, forex, indices) — no spot market,
+    # so klines/trades are unavailable and signals would be meaningless.
+    _NON_CRYPTO_BASES = frozenset([
+        'GBP', 'AUD', 'CAD', 'CHF', 'EUR', 'JPY', 'HKD',           # forex
+        'SILVER', 'NICKEL', 'ZINC', 'LEAD', 'COPPER', 'ALUMINUM',   # metals
+        'USOIL', 'UKOIL',                                            # oil
+        'SPX500', 'HK50', 'SOXX', 'EWY', 'EWJ', 'US30', 'XLE',       # indices/ETFs
+        'NVIDIA', 'TESLA', 'COINBASE', 'ANTHROPIC',                  # stocks w/o STOCK suffix
+        'XAUT', 'PAXG',                                              # gold tokens (no MEXC spot)
+    ])
+
+    @staticmethod
+    def _is_crypto_futures(symbol: str) -> bool:
+        if 'STOCK' in symbol:
+            return False
+        base = symbol[:-5] if symbol.endswith('_USDT') else symbol
+        return base not in BatchScanner._NON_CRYPTO_BASES
+
+    def __init__(self, mexc_client: Optional[MEXCRestClient]=None, mc_cache: Optional[MarketCapCache]=None, change_thresholds: Optional[Dict[str, float]]=None, oi_tracker=None, squeeze_detector: Optional[SqueezeDetector]=None):
         self._mexc_client = mexc_client
         self._mc_cache = mc_cache
         self._thresholds = change_thresholds or self.DEFAULT_THRESHOLDS
+        self._oi_tracker = oi_tracker
+        self._squeeze_detector = squeeze_detector
         self._previous_snapshots: Dict[str, TokenSnapshot] = {}
         self._fresh_symbols: Set[str] = set()
         self._stats = {'total_scans': 0, 'total_tokens': 0, 'tokens_changed': 0, 'tokens_unchanged': 0, 'scan_time': 0.0}
@@ -68,10 +91,48 @@ class BatchScanner:
         if not response.get('success'):
             raise RuntimeError('Failed to fetch MEXC futures list')
         contracts = response.get('data', [])
-        usdt_futures = [c['symbol'] for c in contracts if c['symbol'].endswith('_USDT')]
+        usdt_futures = [
+            c['symbol'] for c in contracts
+            if c['symbol'].endswith('_USDT') and self._is_crypto_futures(c['symbol'])
+        ]
         return usdt_futures
 
     async def create_snapshots(self, symbols: List[str]) -> Dict[str, TokenSnapshot]:
+        try:
+            return await self._fetch_bulk_snapshots(symbols)
+        except Exception as e:
+            logger.warning(f'Bulk snapshot fetch failed ({e}), falling back to individual fetches')
+            return await self._fetch_individual_snapshots(symbols)
+
+    async def _fetch_bulk_snapshots(self, symbols: List[str]) -> Dict[str, TokenSnapshot]:
+        url = f'{MEXCConfig.FUTURES_BASE_URL}/api/v1/contract/ticker'
+        response = await self._mexc_client._request('GET', url)
+        if not response.get('success'):
+            raise RuntimeError(f'Bulk ticker API returned failure: {response.get("message", "unknown")}')
+        data = response.get('data', [])
+        if not isinstance(data, list):
+            raise RuntimeError(f'Expected list from bulk ticker endpoint, got {type(data).__name__}')
+        symbol_set = set(symbols)
+        snapshots: Dict[str, TokenSnapshot] = {}
+        ts = time.time()
+        for item in data:
+            sym = item.get('symbol', '')
+            if sym not in symbol_set:
+                continue
+            snapshots[sym] = TokenSnapshot(
+                symbol=sym,
+                price=float(item.get('lastPrice') or 0),
+                oi_contracts=float(item.get('holdVol') or 0),
+                volume_24h=float(item.get('amount24') or 0),
+                timestamp=ts,
+                long_score=0.0,
+                short_score=0.0,
+                funding_rate=float(item.get('fundingRate') or 0),
+            )
+        logger.info(f'Bulk snapshot: {len(snapshots)}/{len(symbols)} symbols matched from {len(data)} tickers')
+        return snapshots
+
+    async def _fetch_individual_snapshots(self, symbols: List[str]) -> Dict[str, TokenSnapshot]:
         snapshots = {}
         for i in range(0, len(symbols), self.SNAPSHOT_BATCH):
             batch = symbols[i:i + self.SNAPSHOT_BATCH]
@@ -110,8 +171,24 @@ class BatchScanner:
     async def scan_token(self, symbol: str, aggregator: DataAggregator, generator: SignalGenerator) -> Optional[TokenSnapshot]:
         try:
             market_data = await aggregator.aggregate(symbol)
+            if self._oi_tracker is not None:
+                db_symbol = normalize_symbol(symbol)
+                oi_change_1h = self._oi_tracker.get_oi_change_pct(db_symbol, minutes=60)
+                oi_change_5m = self._oi_tracker.get_oi_change_pct(db_symbol, minutes=5)
+                if oi_change_1h is not None or oi_change_5m is not None:
+                    market_data = market_data.model_copy(update={
+                        'oi_change_1h': oi_change_1h,
+                        'oi_change_5m': oi_change_5m,
+                    })
             analysis = generator.analyze_only(market_data)
-            return TokenSnapshot(symbol=symbol, price=market_data.price, oi_contracts=market_data.open_interest_usd / market_data.price if market_data.price > 0 else 0, volume_24h=market_data.volume_24h, timestamp=time.time(), long_score=analysis['long_score'], short_score=analysis['short_score'], open_interest_usd=market_data.open_interest_usd, funding_rate=market_data.funding_rate)
+            sq_long, sq_short = 0.0, 0.0
+            if self._squeeze_detector is not None:
+                sq = self._squeeze_detector.detect(market_data)
+                sq_long, sq_short = sq.long_score, sq.short_score
+            return TokenSnapshot(symbol=symbol, price=market_data.price, oi_contracts=market_data.open_interest_usd / market_data.price if market_data.price > 0 else 0, volume_24h=market_data.volume_24h, timestamp=time.time(), long_score=analysis['long_score'], short_score=analysis['short_score'], open_interest_usd=market_data.open_interest_usd, funding_rate=market_data.funding_rate, squeeze_long=sq_long, squeeze_short=sq_short)
+        except ValueError:
+            logger.debug(f'Skipping {symbol}: no price data (futures-only, no spot market)')
+            return None
         except Exception as e:
             logger.warning(f'Error scanning {symbol}: {e}')
             return None
@@ -141,10 +218,19 @@ class BatchScanner:
             print('📸 Creating snapshots (incremental)...')
             logger.info('Creating snapshots (incremental)...')
             current_snapshots = await self.create_snapshots(all_symbols)
-            print(f'   Created {len(current_snapshots)} snapshots')
+            snapshot_failed = [s for s in all_symbols if s not in current_snapshots]
+            print(f'   Created {len(current_snapshots)} snapshots ({len(snapshot_failed)} failed)')
             print('🔍 Detecting changes...')
             changed_symbols, unchanged_snapshots = await self.detect_changes(current_snapshots)
-            force_rescan = [sym for sym, snap in self._previous_snapshots.items() if max(snap.long_score, snap.short_score) >= self.FORCE_RESCAN_SCORE and sym not in changed_symbols]
+            if snapshot_failed:
+                changed_symbols = changed_symbols + snapshot_failed
+            force_rescan = [
+                sym for sym, snap in self._previous_snapshots.items()
+                if sym not in changed_symbols and (
+                    max(snap.long_score, snap.short_score) >= self.FORCE_RESCAN_SCORE
+                    or max(snap.squeeze_long, snap.squeeze_short) >= self.FORCE_RESCAN_SQUEEZE_SCORE
+                )
+            ]
             if force_rescan:
                 print(f'   Force-rescanning {len(force_rescan)} high-score tokens...')
                 logger.info(f'Force-rescanning {len(force_rescan)} high-score tokens: {force_rescan}')

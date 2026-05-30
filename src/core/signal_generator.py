@@ -1,5 +1,8 @@
+import logging
 from datetime import datetime, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 from ..models.market_data import MarketData
 from ..models.signal import Signal, Target
 from ..models.analyzer_result import AnalyzerResult
@@ -11,18 +14,20 @@ from ..analyzers.volume_spike_analyzer import VolumeSpikeAnalyzer
 from ..analyzers.already_pumped_analyzer import AlreadyPumpedAnalyzer
 from ..analyzers.oi_nowcast_analyzer import OINowcastAnalyzer
 from ..analyzers.order_book_analyzer import OrderBookAnalyzer
+from ..analyzers.market_regime_detector import MarketRegimeDetector
+from ..analyzers.oi_divergence_analyzer import OIDivergenceAnalyzer
 
 class SignalGenerator:
     MIN_SIGNAL_SCORE = 6.5
     MIN_ANALYZERS = 3
     REQUIRED_OI_ANALYZERS = {'OI/MC Analyzer', 'OI Nowcast'}
-    KINETIC_ANALYZERS = {'Volume Spike Analyzer', 'Aggression Analyzer', 'OI Nowcast'}
+    KINETIC_ANALYZERS = {'Volume Spike Analyzer', 'OI Nowcast'}
     MIN_KINETIC_SCORE = 6.0
     COVERAGE_MULTIPLIERS = {1: 0.5, 2: 0.7, 3: 0.85, 4: 0.95}
     MOMENTUM_AGGRESSION_MIN = 9.0
     MOMENTUM_VOLUME_MIN = 6.0
     MIN_VOLUME_24H = 100000
-    MIN_PRICE_CHANGE_24H = 0.5
+    MIN_PRICE_CHANGE_24H = 0.1
     STOP_LOSS_ATR_MULT = 2.0
     TARGET1_ATR_MULT = 1.5
     TARGET2_ATR_MULT = 3.0
@@ -34,7 +39,8 @@ class SignalGenerator:
 
     def __init__(self):
         self._oi_nowcast = OINowcastAnalyzer(weight=1.5)
-        self.analyzers = [OIMCAnalyzer(weight=2.0), FundingRateAnalyzer(weight=1.0), AggressionAnalyzer(weight=1.5), LiquidationAnalyzer(weight=1.0), VolumeSpikeAnalyzer(weight=1.0), AlreadyPumpedAnalyzer(weight=0.5), OrderBookAnalyzer(weight=1.0), self._oi_nowcast]
+        self._regime_detector = MarketRegimeDetector()
+        self.analyzers = [OIMCAnalyzer(weight=2.0), FundingRateAnalyzer(weight=1.0), AggressionAnalyzer(weight=1.5), LiquidationAnalyzer(weight=1.0), VolumeSpikeAnalyzer(weight=1.0), AlreadyPumpedAnalyzer(weight=0.5), OrderBookAnalyzer(weight=1.0), self._oi_nowcast, OIDivergenceAnalyzer(weight=1.25)]
 
     def set_database(self, db) -> None:
         self._oi_nowcast.set_database(db)
@@ -43,9 +49,12 @@ class SignalGenerator:
         OINowcastAnalyzer.begin_cycle()
 
     def generate(self, data: MarketData) -> Optional[Signal]:
+        sym = data.symbol
         if data.volume_24h < self.MIN_VOLUME_24H:
+            logger.info(f'[Signal] {sym} → NO SIGNAL: volume ${data.volume_24h:,.0f} < ${self.MIN_VOLUME_24H:,.0f}')
             return None
         if data.price_change_24h is not None and abs(data.price_change_24h) < self.MIN_PRICE_CHANGE_24H:
+            logger.info(f'[Signal] {sym} → NO SIGNAL: price_change_24h {data.price_change_24h:.2f}% too flat')
             return None
         results: list[AnalyzerResult] = []
         for analyzer in self.analyzers:
@@ -53,11 +62,14 @@ class SignalGenerator:
             if result is not None:
                 results.append(result)
         if len(results) < self.MIN_ANALYZERS:
+            logger.info(f'[Signal] {sym} → NO SIGNAL: only {len(results)} analyzers fired (min {self.MIN_ANALYZERS})')
             return None
         result_names = {r.analyzer_name for r in results}
         if not result_names & self.REQUIRED_OI_ANALYZERS:
+            logger.info(f'[Signal] {sym} → NO SIGNAL: missing required OI analyzer (got {result_names})')
             return None
         self._apply_momentum_override(results)
+        self._apply_extreme_funding_override(results, data)
         blocks_long = any((r.blocks_long for r in results))
         blocks_short = any((r.blocks_short for r in results))
         long_score, long_confidence = self._calculate_weighted_score(results, direction='long')
@@ -65,15 +77,34 @@ class SignalGenerator:
         coverage_mult = self.COVERAGE_MULTIPLIERS.get(len(results), 1.0)
         long_score *= coverage_mult
         short_score *= coverage_mult
+        regime = self._regime_detector.detect(data)
+        logger.debug(f'[Regime] {sym} → {regime.regime}: {regime.reasoning}')
+        if regime.skip:
+            logger.info(f'[Signal] {sym} → NO SIGNAL: regime={regime.regime} ({regime.reasoning})')
+            return None
+        long_score = min(10.0, long_score * regime.long_mult)
+        short_score = min(10.0, short_score * regime.short_mult)
         direction = None
         final_score = 0.0
         final_confidence = 0.0
         long_valid = long_score >= self.MIN_SIGNAL_SCORE and (not blocks_long)
         short_valid = short_score >= self.MIN_SIGNAL_SCORE and (not blocks_short)
+        if not long_valid and long_score >= self.MIN_SIGNAL_SCORE and blocks_long:
+            blockers = [r.analyzer_name for r in results if r.blocks_long]
+            logger.info(f'[Signal] {sym} → LONG blocked by: {blockers} (score={long_score:.1f})')
+        if not short_valid and short_score >= self.MIN_SIGNAL_SCORE and blocks_short:
+            blockers = [r.analyzer_name for r in results if r.blocks_short]
+            logger.info(f'[Signal] {sym} → SHORT blocked by: {blockers} (score={short_score:.1f})')
         if long_valid:
             long_valid = self._check_kinetic_confirmation(results, 'LONG')
+            if not long_valid:
+                kinetic_scores = {r.analyzer_name: r.long_score for r in results if r.analyzer_name in self.KINETIC_ANALYZERS}
+                logger.info(f'[Signal] {sym} → LONG kinetic check failed (need >={self.MIN_KINETIC_SCORE}): {kinetic_scores}, raw_score={long_score:.1f}')
         if short_valid:
             short_valid = self._check_kinetic_confirmation(results, 'SHORT')
+            if not short_valid:
+                kinetic_scores = {r.analyzer_name: r.short_score for r in results if r.analyzer_name in self.KINETIC_ANALYZERS}
+                logger.info(f'[Signal] {sym} → SHORT kinetic check failed (need >={self.MIN_KINETIC_SCORE}): {kinetic_scores}, raw_score={short_score:.1f}')
         if long_valid and short_valid:
             if long_score >= short_score:
                 direction = 'LONG'
@@ -92,6 +123,8 @@ class SignalGenerator:
             final_score = short_score
             final_confidence = short_confidence
         else:
+            if long_score < self.MIN_SIGNAL_SCORE and short_score < self.MIN_SIGNAL_SCORE:
+                logger.info(f'[Signal] {sym} → NO SIGNAL: scores too low L={long_score:.1f} S={short_score:.1f} (min {self.MIN_SIGNAL_SCORE})')
             return None
         entry_price = data.price
         stop_loss, stop_loss_percent = self._calculate_stop_loss(data, direction)
@@ -107,6 +140,7 @@ class SignalGenerator:
             if result is not None:
                 results.append(result)
         self._apply_momentum_override(results)
+        self._apply_extreme_funding_override(results, data)
         result_names = {r.analyzer_name for r in results}
         insufficient = len(results) < self.MIN_ANALYZERS or not result_names & self.REQUIRED_OI_ANALYZERS
         blocks_long = any((r.blocks_long for r in results))
@@ -116,13 +150,19 @@ class SignalGenerator:
         coverage_mult = self.COVERAGE_MULTIPLIERS.get(len(results), 1.0)
         long_score *= coverage_mult
         short_score *= coverage_mult
+        regime = self._regime_detector.detect(data)
+        long_score = min(10.0, long_score * regime.long_mult)
+        short_score = min(10.0, short_score * regime.short_mult)
         long_valid = long_score >= self.MIN_SIGNAL_SCORE and (not blocks_long)
         short_valid = short_score >= self.MIN_SIGNAL_SCORE and (not blocks_short)
         if long_valid:
             long_valid = self._check_kinetic_confirmation(results, 'LONG')
         if short_valid:
             short_valid = self._check_kinetic_confirmation(results, 'SHORT')
-        return {'symbol': data.symbol, 'results': results, 'long_score': round(long_score, 1), 'short_score': round(short_score, 1), 'long_confidence': round(long_confidence, 2), 'short_confidence': round(short_confidence, 2), 'blocks_long': blocks_long, 'blocks_short': blocks_short, 'would_signal': 'INSUFFICIENT DATA' if insufficient else 'LONG' if long_valid else 'SHORT' if short_valid else 'NO SIGNAL', 'analyzers_count': len(results), 'coverage_mult': round(coverage_mult, 2)}
+        would_signal = 'INSUFFICIENT DATA' if insufficient else 'LONG' if long_valid else 'SHORT' if short_valid else 'NO SIGNAL'
+        if regime.skip:
+            would_signal = 'NO SIGNAL (ILLIQUID)'
+        return {'symbol': data.symbol, 'results': results, 'long_score': round(long_score, 1), 'short_score': round(short_score, 1), 'long_confidence': round(long_confidence, 2), 'short_confidence': round(short_confidence, 2), 'blocks_long': blocks_long, 'blocks_short': blocks_short, 'would_signal': would_signal, 'analyzers_count': len(results), 'coverage_mult': round(coverage_mult, 2), 'regime': regime.regime, 'regime_reasoning': regime.reasoning}
 
     def _calculate_weighted_score(self, results: list[AnalyzerResult], direction: str) -> tuple[float, float]:
         if not results:
@@ -156,24 +196,64 @@ class SignalGenerator:
     def _apply_momentum_override(self, results: list[AnalyzerResult]) -> bool:
         aggression_long = 0.0
         volume_long = 0.0
+        oi_mc_ratio = None
         for r in results:
             if r.analyzer_name == 'Aggression Analyzer':
                 aggression_long = r.long_score
             elif r.analyzer_name == 'Volume Spike Analyzer':
                 volume_long = r.long_score
+            elif r.analyzer_name == 'OI/MC Analyzer':
+                # key_value holds the actual OI/MC ratio for this analyzer
+                oi_mc_ratio = r.key_value
         if not (aggression_long >= self.MOMENTUM_AGGRESSION_MIN and volume_long >= self.MOMENTUM_VOLUME_MIN):
+            return False
+        # Never override when OI/MC is in short/danger territory (>= 0.60).
+        # High aggression + volume spike in an overleveraged market = retail FOMO
+        # at the top, not a genuine long setup. Entering long here is a trap.
+        if oi_mc_ratio is not None and oi_mc_ratio >= 0.60:
             return False
         applied = False
         for r in results:
-            if r.analyzer_name == 'OI/MC Analyzer' and r.long_score < 5.0:
-                r.long_score = 5.0
-                r.reasoning += ' | MOMENTUM OVERRIDE: neutralized low OI/MC'
-                applied = True
+            if r.analyzer_name == 'OI/MC Analyzer' and r.blocks_long:
+                # only neutralize the block if ratio is below danger threshold
+                if oi_mc_ratio is None or oi_mc_ratio < 0.60:
+                    r.blocks_long = False
+                    r.long_score = max(r.long_score, 5.0)
+                    r.reasoning += ' | MOMENTUM OVERRIDE: OI/MC block lifted by strong momentum'
+                    applied = True
             elif r.analyzer_name == 'Already Pumped Analyzer' and r.blocks_long:
                 r.blocks_long = False
                 r.long_score = 5.0
-                r.reasoning += ' | MOMENTUM OVERRIDE: block + score neutralized'
+                r.short_score = min(r.short_score, 3.0)
+                r.reasoning += ' | MOMENTUM OVERRIDE: pump block lifted by strong momentum'
                 applied = True
+        return applied
+
+    def _apply_extreme_funding_override(self, results: list[AnalyzerResult], data: MarketData) -> bool:
+        """Lift blocks_short/blocks_long from Aggression and Volume Spike when funding is extreme (≥ 0.2%).
+
+        Extreme positive funding means longs are structurally overloaded — even a bullish
+        volume spike shouldn't block SHORT in this context (distribution top).
+        Symmetric: extreme negative funding lifts blocks_long from both analyzers.
+        """
+        THRESHOLD = 0.002  # 0.2%
+        OVERRIDE_ANALYZERS = {'Aggression Analyzer', 'Volume Spike Analyzer'}
+        rate = data.funding_rate or 0.0
+        applied = False
+        if rate >= THRESHOLD:
+            for r in results:
+                if r.analyzer_name in OVERRIDE_ANALYZERS and r.blocks_short:
+                    r.blocks_short = False
+                    r.short_score = max(r.short_score, 2.0)
+                    r.reasoning += f' | EXTREME FUNDING OVERRIDE: blocks_short lifted (funding {rate * 100:.3f}%)'
+                    applied = True
+        elif rate <= -THRESHOLD:
+            for r in results:
+                if r.analyzer_name in OVERRIDE_ANALYZERS and r.blocks_long:
+                    r.blocks_long = False
+                    r.long_score = max(r.long_score, 2.0)
+                    r.reasoning += f' | EXTREME FUNDING OVERRIDE: blocks_long lifted (funding {rate * 100:.3f}%)'
+                    applied = True
         return applied
 
     def _calculate_stop_loss(self, data: MarketData, direction: str) -> tuple[float, float]:

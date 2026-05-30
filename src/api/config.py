@@ -9,6 +9,8 @@ class MEXCConfig:
     FUTURES_OPEN_INTEREST: Final[str] = '/api/v1/contract/open_interest/{symbol}'
     FUTURES_FUNDING_RATE: Final[str] = '/api/v1/contract/funding_rate/{symbol}'
     FUTURES_TICKER: Final[str] = '/api/v1/contract/ticker'
+    FUTURES_KLINES: Final[str] = '/api/v1/contract/kline'
+    FUTURES_DEALS: Final[str] = '/api/v1/contract/deals'
     RATE_LIMIT_WEIGHT_PER_MINUTE: Final[int] = 1200
     RATE_LIMIT_REQUESTS_PER_SECOND: Final[int] = 20
     REQUEST_TIMEOUT: Final[int] = 20

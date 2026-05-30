@@ -87,7 +87,7 @@ async def cmd_analyze(args):
 
 
 
-    async with MEXCRestClient() as mexc_client,
+    async with MEXCRestClient() as mexc_client, \
                MarketCapCache() as mc_cache:
 
 
@@ -222,6 +222,12 @@ async def cmd_analyze(args):
 
                 print(f"  Analyzers:   {analysis['analyzers_count']}")
 
+                regime = analysis.get('regime', 'UNKNOWN')
+
+                regime_reason = analysis.get('regime_reasoning', '')
+
+                print(f"  Regime:      {regime} ({regime_reason})")
+
 
 
                                 
@@ -320,7 +326,7 @@ async def cmd_scan(args):
 
 
 
-    async with MEXCRestClient() as mexc_client,
+    async with MEXCRestClient() as mexc_client, \
                MarketCapCache() as mc_cache:
 
 
@@ -503,11 +509,15 @@ async def cmd_bot(args):
 
     from src.bot.alerter import Alerter
 
+    from src.database import get_database
+
 
 
     print("\n[INFO] Loading .env...")
 
-    bot = create_bot_from_env()
+    db = get_database()
+
+    bot = create_bot_from_env(db=db)
 
     alerter = Alerter(bot)
 

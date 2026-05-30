@@ -2,7 +2,8 @@ import logging
 import time
 from src.models.signal import Signal
 from src.models.market_data import MarketData
-from src.bot.formatters import format_signal_alert
+from src.models.squeeze_alert import SqueezeAlert
+from src.bot.formatters import format_signal_alert, format_squeeze_alert
 logger = logging.getLogger(__name__)
 
 class Alerter:
@@ -30,6 +31,17 @@ class Alerter:
             logger.info(f'[Alerter] Sent: {symbol} {signal.direction} {signal.overall_score:.1f}/10')
         except Exception as e:
             logger.error(f'[Alerter] Failed to send alert for {symbol}: {e}')
+
+    async def send_squeeze_alert(self, alert: SqueezeAlert):
+        try:
+            text = format_squeeze_alert(alert)
+            await self._bot.send_signal(text)
+            logger.info(
+                f'[Alerter] Squeeze: {alert.symbol} {alert.direction} '
+                f'{alert.alert_level} {alert.squeeze_score:.1f}/10'
+            )
+        except Exception as e:
+            logger.error(f'[Alerter] Failed to send squeeze alert for {alert.symbol}: {e}')
 
     def update_monitor_status(self, tracked_count: int):
         self._bot.set_monitor_status(running=True, tracked_count=tracked_count)
