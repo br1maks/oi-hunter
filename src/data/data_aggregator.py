@@ -64,17 +64,20 @@ class DataAggregator:
         """Fetch all data for a symbol and return a populated MarketData."""
         base_symbol = symbol.replace('_USDT', '').replace('USDT', '').upper()
 
-        # run primary API calls concurrently; individual failures return None
-        ticker, oi_data, funding_data, ob_data = await asyncio.gather(
+        # run all primary API calls concurrently; individual failures return None
+        ticker, oi_data, funding_data, ob_data, klines, trades = await asyncio.gather(
             self._safe(self._client.get_ticker_24h, symbol),
             self._safe(self._client.get_open_interest, symbol),
             self._safe(self._client.get_funding_rate, symbol),
             self._safe(self._client.get_order_book, symbol, 20),
+            self._safe(self._client.get_klines, symbol, '1h', self.KLINE_COUNT),
+            self._safe(self._client.get_recent_trades, symbol, self.TRADES_LIMIT),
         )
-        # klines and trades with futures fallback — sequential so _contract_size_cache
-        # (populated by get_open_interest above) is available for get_futures_deals
-        klines = await self._klines_with_fallback(symbol)
-        trades = await self._trades_with_fallback(symbol)
+        # futures fallback — runs after gather so _contract_size_cache is already populated
+        if not klines:
+            klines = await self._safe(self._client.get_futures_klines, symbol, '1h', self.KLINE_COUNT) or []
+        if not trades:
+            trades = await self._safe(self._client.get_futures_deals, symbol, self.TRADES_LIMIT) or []
 
         price = self._parse_price(ticker)
         if (price is None or price <= 0) and oi_data:
@@ -134,24 +137,6 @@ class DataAggregator:
             ob_t2_ask_vol=ob_metrics.get('t2_ask'),
             ob_spread_pct=ob_metrics.get('spread_pct'),
         )
-
-    # ------------------------------------------------------------------
-    # Klines / trades with spot→futures fallback
-    # ------------------------------------------------------------------
-
-    async def _klines_with_fallback(self, symbol: str) -> list:
-        klines = await self._safe(self._client.get_klines, symbol, '1h', self.KLINE_COUNT)
-        if klines:
-            return klines
-        logger.debug(f'{symbol}: spot klines empty, trying futures klines')
-        return await self._safe(self._client.get_futures_klines, symbol, '1h', self.KLINE_COUNT) or []
-
-    async def _trades_with_fallback(self, symbol: str) -> list:
-        trades = await self._safe(self._client.get_recent_trades, symbol, self.TRADES_LIMIT)
-        if trades:
-            return trades
-        logger.debug(f'{symbol}: spot trades empty, trying futures deals')
-        return await self._safe(self._client.get_futures_deals, symbol, self.TRADES_LIMIT) or []
 
     # ------------------------------------------------------------------
     # Market cap

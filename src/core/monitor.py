@@ -78,7 +78,7 @@ class Monitor:
             async with MarketCapCache() as mc_cache:
                 self._mc_cache = mc_cache
                 print('  Loading market caps from CoinGecko...')
-                loaded = await mc_cache.refresh(max_pages=4)
+                loaded = await mc_cache.refresh(max_pages=8)
                 print(f'  Loaded {loaded} market caps\n')
                 if self._alerter and hasattr(self._alerter, '_bot'):
                     self._alerter._bot.set_market_cap_cache(mc_cache)

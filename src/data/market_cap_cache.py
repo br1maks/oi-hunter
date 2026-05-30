@@ -40,7 +40,7 @@ class MarketCapCache:
     def size(self) -> int:
         return len(self._cache)
 
-    async def refresh(self, max_pages: int = 4) -> int:
+    async def refresh(self, max_pages: int = 8) -> int:
         """Bulk-load top coins from CoinGecko. Returns number of coins loaded."""
         if not self._client:
             raise RuntimeError('Use async with MarketCapCache() context manager')

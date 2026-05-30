@@ -335,7 +335,7 @@ async def cmd_scan(args):
 
         print("\n[INFO] Loading market cap cache...")
 
-        loaded = await mc_cache.refresh(max_pages=5)
+        loaded = await mc_cache.refresh(max_pages=8)
 
         print(f"[OK] Cached {loaded} coins")
 
