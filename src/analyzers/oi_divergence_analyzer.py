@@ -10,10 +10,11 @@ logger = logging.getLogger(__name__)
 class OIDivergenceAnalyzer(BaseAnalyzer):
     """Detects divergence between OI, volume, and price — signature of smart money activity.
 
-    Three patterns (checked in priority order):
-      1. DISTRIBUTION   — price pumping, OI not growing -> smart money exiting into the rally
-      2. WASH_TRADING   — massive volume spike, OI barely moves -> fake/artificial activity
-      3. SILENT_ACCUM   — OI building quietly with below-avg volume -> two variants:
+    Four patterns (checked in priority order):
+      1. DISTRIBUTION        — price pumping, OI not growing -> smart money exiting into rally
+      2. WASH_TRADING        — massive volume spike, OI barely moves -> artificial activity
+      3. BEARISH_OI_DIVERGENCE — OI surging while price falls -> shorts accumulating aggressively
+      4. SILENT_ACCUM        — OI building quietly with below-avg volume -> two variants:
            - neutral/positive funding -> institutional long accumulation (bullish, long_score=6.5)
            - strongly negative funding -> possible short accumulation (bearish, short_score=5.0)
 
@@ -35,6 +36,12 @@ class OIDivergenceAnalyzer(BaseAnalyzer):
     ACCUM_OI_MIN = 5.0      # oi_change_1h must exceed this % (meaningful OI growth)
     ACCUM_VOL_MAX = 0.8     # volume_ratio must be below this (below-average volume)
     ACCUM_PRICE_FLAT = 1.0  # |price_change_1h| must be below this (price not moving)
+
+    # Pattern 4 — Bearish OI divergence thresholds
+    BEARISH_OI_MOD = 10.0       # oi_change_1h >= this % = shorts entering moderately
+    BEARISH_OI_STRONG = 25.0    # oi_change_1h >= this % = shorts entering aggressively
+    BEARISH_PRICE_MOD = -0.5    # price_change_1h <= this % = price clearly falling
+    BEARISH_PRICE_STRONG = -1.0 # price_change_1h <= this % = strong bearish confirmation
 
     def __init__(self, weight: float = 1.0):
         super().__init__(weight=weight)
@@ -100,6 +107,32 @@ class OIDivergenceAnalyzer(BaseAnalyzer):
                     key_value=round(vol_ratio, 2),
                     key_label='Vol/OI ratio',
                 )
+
+        # ── Pattern 4: BEARISH OI DIVERGENCE ─────────────────────────────────────
+        # OI surging while price falls = new short positions entering aggressively.
+        # This is checked BEFORE silent accumulation because falling price (< -0.5%)
+        # is more specific than flat price — it overrides the bullish accumulation read.
+        # No funding rate check: price direction already confirms who has pricing power.
+        # (Short squeeze requires price UP + OI DOWN — the exact opposite of this pattern.)
+        if price_1h is not None and price_1h <= self.BEARISH_PRICE_MOD and oi_1h >= self.BEARISH_OI_MOD:
+            is_strong = oi_1h >= self.BEARISH_OI_STRONG and price_1h <= self.BEARISH_PRICE_STRONG
+            short_score = 8.0 if is_strong else 6.5
+            confidence = 0.85 if is_strong else 0.75
+            label = 'aggressive' if is_strong else 'moderate'
+            logger.debug('[OI Divergence] %s: OI %+.1f%% price %+.1f%% -> BEARISH_DIV (%s) blocks_long',
+                         data.symbol, oi_1h, price_1h, label)
+            return AnalyzerResult(
+                analyzer_name=self.analyzer_name,
+                long_score=1.0,
+                short_score=short_score,
+                confidence=confidence,
+                reasoning=f'OI {oi_1h:+.1f}% but price {price_1h:+.1f}% → {label} short accumulation',
+                blocks_long=True,
+                blocks_short=False,
+                alert_level='warning',
+                key_value=round(oi_1h, 2),
+                key_label='Bearish OI divergence %',
+            )
 
         # ── Pattern 3: SILENT ACCUMULATION ───────────────────────────────────────
         # OI building significantly while volume is below average and price quiet.

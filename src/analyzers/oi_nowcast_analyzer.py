@@ -198,15 +198,24 @@ class OINowcastAnalyzer(BaseAnalyzer):
         long_score = min(10.0, long_score + long_bonus)
         short_score = min(10.0, short_score + short_bonus)
         # Price-OI direction check: OI growing while price falling = shorts entering,
-        # not longs accumulating. Reduce long score proportionally.
+        # not longs accumulating. Two tiers based on OI surge strength.
         price_dir_note = ''
         if data.price_change_1h is not None and velocity > 0:
             price_drop = -data.price_change_1h
-            if price_drop > 1.0:
-                penalty = min(4.0, price_drop * 0.8)
+            predicted_change = pred_10min['predicted_change_pct']
+            if price_drop >= 0.5 and predicted_change >= 5.0:
+                # OI SURGING + price falling: the surge is shorts, not longs.
+                # Flip the kinetic interpretation so OINowcast provides short kinetic confirmation.
+                kinetic = long_score
+                long_score = max(1.0, 10.0 - kinetic)
+                short_score = min(10.0, kinetic * 0.75)
+                price_dir_note = f' [BEARISH DIV: OI surging price{data.price_change_1h:+.1f}%→short kinetic {short_score:.1f}]'
+            elif price_drop >= 0.5:
+                # OI growing (not surging) + price falling: moderate penalty.
+                penalty = min(3.0, price_drop * 1.5)
                 long_score = max(1.0, long_score - penalty)
-                short_score = min(10.0, short_score + penalty * 0.5)
-                price_dir_note = f' [price↓{data.price_change_1h:+.1f}%→shorts]'
+                short_score = min(10.0, short_score + penalty)
+                price_dir_note = f' [price↓{data.price_change_1h:+.1f}%→shorts {short_score:.1f}]'
         OINowcastAnalyzer._phase_cache[symbol] = (prev_phase, current_phase, cycle_id)
         blocks_long = pred_10min['predicted_change_pct'] <= -5
         blocks_short = pred_10min['predicted_change_pct'] >= 10

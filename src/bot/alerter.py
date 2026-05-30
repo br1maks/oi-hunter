@@ -12,6 +12,7 @@ class Alerter:
     def __init__(self, bot):
         self._bot = bot
         self._last_alert: dict[str, float] = {}
+        self._last_direction: dict[str, str] = {}
 
     def is_on_cooldown(self, symbol: str) -> bool:
         last = self._last_alert.get(symbol, 0)
@@ -25,9 +26,11 @@ class Alerter:
             logger.debug(f'[Alerter] {symbol} cooldown {remaining}s')
             return
         try:
-            text = format_signal_alert(signal, market_data)
+            previous_direction = self._last_direction.get(symbol)
+            text = format_signal_alert(signal, market_data, previous_direction=previous_direction)
             await self._bot.send_signal(text)
             self._last_alert[symbol] = time.time()
+            self._last_direction[symbol] = signal.direction
             logger.info(f'[Alerter] Sent: {symbol} {signal.direction} {signal.overall_score:.1f}/10')
         except Exception as e:
             logger.error(f'[Alerter] Failed to send alert for {symbol}: {e}')

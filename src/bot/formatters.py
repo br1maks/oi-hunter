@@ -4,7 +4,7 @@ from src.models.market_data import MarketData
 from src.models.analyzer_result import AnalyzerResult
 from src.models.squeeze_alert import SqueezeAlert
 
-def format_signal_alert(signal: Signal, market_data: MarketData) -> str:
+def format_signal_alert(signal: Signal, market_data: MarketData, previous_direction: Optional[str] = None) -> str:
     symbol = _clean_symbol(signal.symbol)
     direction = signal.direction
     base_emoji = '🟢' if direction == 'LONG' else '🔴'
@@ -15,6 +15,8 @@ def format_signal_alert(signal: Signal, market_data: MarketData) -> str:
     analyzer_count = len(signal.analyzer_results)
     score_line = f'Score: {signal.overall_score:.1f}/10  ({analyzer_count} analyzers)'
     lines = [header, score_line, '━━━━━━━━━━━━━━━━━━━━━', '']
+    if previous_direction and previous_direction != direction:
+        lines = [f'🔄 Разворот: {previous_direction} → {direction}', ''] + lines
     lines.append(f'Price:   {_fmt_price(signal.current_price)}')
     if market_data.open_interest_usd:
         lines.append(f'OI:      ${market_data.open_interest_usd:,.0f}')
