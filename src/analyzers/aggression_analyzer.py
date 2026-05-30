@@ -107,6 +107,19 @@ class AggressionAnalyzer(BaseAnalyzer):
                 long_score, short_score = new_long, new_short
         blocks_long = agg_2h < 30.0
         blocks_short = agg_2h > 70.0
+        # 5m override: lift the block when reliable 5m data clearly contradicts the 2h picture.
+        # agg_2h lags up to 60 min — at reversal peaks it still reflects prior buying
+        # while sellers have already taken over in the most recent 5 minutes.
+        if blocks_short and has_reliable_5m and data.aggression_5m <= 40.0:
+            blocks_short = False
+            reasoning_parts.append(
+                f'blocks_short LIFTED: 5M={data.aggression_5m:.0f}% (seller dominant) vs 2H={agg_2h:.0f}%'
+            )
+        if blocks_long and has_reliable_5m and data.aggression_5m >= 60.0:
+            blocks_long = False
+            reasoning_parts.append(
+                f'blocks_long LIFTED: 5M={data.aggression_5m:.0f}% (buyer dominant) vs 2H={agg_2h:.0f}%'
+            )
         if agg_2h >= 85 or agg_2h <= 15:
             alert_level = 'critical'
         elif agg_2h >= 70 or agg_2h <= 30:
