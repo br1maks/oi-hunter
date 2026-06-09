@@ -188,7 +188,10 @@ class SqueezeDetector:
             # Aggression must be directionally confirmed with enough trades to be reliable
             agg_reliable = tc is not None and tc >= self.MIN_C3_TRADES
             if direction == 'LONG_SQUEEZE':
-                agg_confirms = agg_reliable and agg is not None and agg >= 70.0
+                agg_confirms = (
+                    agg_reliable and agg is not None and agg >= 70.0
+                    and scores.c1_l is not None and scores.c1_l >= 5.0
+                )
             else:
                 agg_confirms = agg_reliable and agg is not None and (100.0 - agg) >= 70.0
             if vci_transition and agg_confirms:
@@ -201,6 +204,13 @@ class SqueezeDetector:
                 return (direction, 'TRIGGERED')
 
         if score >= self.ALERT_THRESHOLD_STRONG and self._is_in_watch(symbol, now):
+            # LONG STRONG requires the strict Pattern-1 gate; otherwise hold at WATCH.
+            # data is None (no MarketData) is treated as gate-fail → conservative WATCH.
+            if direction == 'LONG_SQUEEZE' and not (
+                data is not None and self._is_strong_long_squeeze(data, scores)
+            ):
+                self._record_watch(symbol, now)
+                return (direction, 'WATCH')
             self._set_cooldown(symbol)
             self._clear_watch(symbol)
             return (direction, 'STRONG')
@@ -312,6 +322,23 @@ class SqueezeDetector:
         score = weighted_sum / total_weight
         return max(0.0, min(10.0, score + funding_adj))
 
+    def _is_strong_long_squeeze(self, data: MarketData, scores: SqueezeScores) -> bool:
+        """Pattern 1 — the only LONG-squeeze configuration validated as reliable
+        (ALLO/NIL profile). All six conditions are mandatory; any miss → WATCH only."""
+        if data.vci is None or data.vci >= self.VCI_COMPRESSED_THRESHOLD:
+            return False                       # no real volatility compression
+        if data.funding_rate >= 0.0:
+            return False                       # FR>=0 → longs pay; shorts not trapped
+        if scores.c1_l is None or scores.c1_l < 7.0:
+            return False                       # no real trapped shorts
+        if data.oi_change_1h is None or data.oi_change_1h <= 5.0:
+            return False                       # no aggressive short build-up
+        if data.price_change_1h is not None and data.price_change_1h > 4.0:
+            return False                       # signal already late (price broke up)
+        if data.open_interest_usd < 500_000:
+            return False                       # market too thin
+        return True
+
     # ------------------------------------------------------------------
     # Long squeeze components
     # ------------------------------------------------------------------
@@ -326,6 +353,10 @@ class SqueezeDetector:
             return None
         # Guard: after a strong recent pump OI grows from FOMO longs, not trapped shorts
         if data.price_change_4h is not None and data.price_change_4h > 20.0:
+            return None
+        # Guard: mid-crash — OI growth is new momentum shorts riding the drop, not
+        # trapped shorts (HUSDT case: P4h -59% with OI +16% scored a false 10.0)
+        if data.price_change_4h is not None and data.price_change_4h < -30.0:
             return None
         oi = data.oi_change_1h
         pc = data.price_change_1h
@@ -411,6 +442,11 @@ class SqueezeDetector:
         return score
 
     def _c4_compression(self, data: MarketData) -> Optional[float]:
+        # VCI >= 0.65 → no real volatility compression (ATR_5 not contracted vs ATR_20).
+        # Any flat-price/low-volume reading here is coincidental drift, not a coiled
+        # spring — score it zero so it drags the composite down instead of inflating it.
+        if data.vci is not None and data.vci >= self.VCI_COMPRESSED_THRESHOLD:
+            return 0.0
         pc1 = data.price_change_1h
         pc4 = data.price_change_4h
         # Override: price already broke upward — spring released, no setup
@@ -633,6 +669,10 @@ class SqueezeDetector:
 
     def _p3_cfc_boost(self, data: MarketData) -> float:
         """Consecutive flat candles → spring loading. Long only."""
+        # Flat candles only mean "coiling" when VCI confirms compression. Above the
+        # threshold they are just low-volatility drift — no boost.
+        if data.vci is not None and data.vci >= self.VCI_COMPRESSED_THRESHOLD:
+            return 0.0
         cfc = data.cfc
         if cfc >= 7:
             return 1.5
