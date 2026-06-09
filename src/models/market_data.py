@@ -71,7 +71,7 @@ class MarketData(BaseModel):
 
     # Squeeze Detector inputs (computed in DataAggregator._parse_klines)
     vci: Optional[float] = Field(None, ge=0, description='Volatility Compression Index (ATR_5/ATR_20, < 0.65 = compressed)')
-    cfc: int = Field(default=0, ge=0, description='Consecutive flat candles count (range < 1.5%)')
+    cfc: int = Field(default=0, ge=0, description='Consecutive flat candles count (range < 2.5%)')
     vwap: Optional[float] = Field(None, gt=0, description='24h VWAP (typical price weighted by volume)')
 
     class Config:

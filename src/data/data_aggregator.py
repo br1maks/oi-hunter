@@ -232,12 +232,12 @@ class DataAggregator:
                     if atr_20 > 0:
                         result['vci'] = atr_5 / atr_20
 
-            # CFC (Consecutive Flat Candles — count candles with range < 1.5% from tail)
+            # CFC (Consecutive Flat Candles — count candles with range < 2.5% from tail)
             # Exclude current open candle (index -1) — same as VCI — its partial range
             # would be artificially narrow early in the candle, giving a false flat count.
             cfc = 0
             for h, l, c in reversed(list(zip(highs[-11:-1], lows[-11:-1], closes[-11:-1]))):
-                if c > 0 and (h - l) / c * 100 < 1.5:
+                if c > 0 and (h - l) / c * 100 < 2.5:
                     cfc += 1
                 else:
                     break

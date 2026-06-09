@@ -78,6 +78,9 @@ class BatchScanner:
         self._previous_snapshots: Dict[str, TokenSnapshot] = {}
         self._fresh_symbols: Set[str] = set()
         self._stats = {'total_scans': 0, 'total_tokens': 0, 'tokens_changed': 0, 'tokens_unchanged': 0, 'scan_time': 0.0}
+        self._symbols_cache: List[str] = []
+        self._symbols_cache_time: float = 0.0
+        self._SYMBOLS_CACHE_TTL: float = 1800.0  # refresh symbol list every 30 min
 
     @property
     def fresh_symbols(self) -> Set[str]:
@@ -86,15 +89,29 @@ class BatchScanner:
     async def get_all_mexc_futures(self) -> List[str]:
         if not self._mexc_client:
             raise RuntimeError('MEXC client not initialized')
+        now = time.time()
+        if self._symbols_cache and (now - self._symbols_cache_time) < self._SYMBOLS_CACHE_TTL:
+            return self._symbols_cache
         url = f'{MEXCConfig.FUTURES_BASE_URL}/api/v1/contract/detail'
-        response = await self._mexc_client._request('GET', url)
+        try:
+            response = await self._mexc_client._request('GET', url)
+        except Exception as e:
+            if self._symbols_cache:
+                logger.warning(f'Failed to refresh futures list ({e}), using cached {len(self._symbols_cache)} symbols')
+                return self._symbols_cache
+            raise RuntimeError(f'Failed to fetch MEXC futures list and no cache available: {e}')
         if not response.get('success'):
+            if self._symbols_cache:
+                logger.warning(f'Futures list API returned failure, using cached {len(self._symbols_cache)} symbols')
+                return self._symbols_cache
             raise RuntimeError('Failed to fetch MEXC futures list')
         contracts = response.get('data', [])
         usdt_futures = [
             c['symbol'] for c in contracts
             if c['symbol'].endswith('_USDT') and self._is_crypto_futures(c['symbol'])
         ]
+        self._symbols_cache = usdt_futures
+        self._symbols_cache_time = now
         return usdt_futures
 
     async def create_snapshots(self, symbols: List[str]) -> Dict[str, TokenSnapshot]:

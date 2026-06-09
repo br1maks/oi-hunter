@@ -22,6 +22,8 @@ def format_signal_alert(signal: Signal, market_data: MarketData, previous_direct
         lines.append(f'OI:      ${market_data.open_interest_usd:,.0f}')
     if signal.oi_mc_ratio is not None:
         lines.append(f'OI/MC:   {signal.oi_mc_ratio:.4f}')
+        if signal.oi_mc_ratio > 0.30:
+            lines.append(f'⚠️ High leverage: OI/MC {signal.oi_mc_ratio:.2f}')
     elif signal.market_cap_usd is None:
         lines.append('OI/MC:   N/A (MC unknown)')
     if market_data.oi_change_1h is not None:
@@ -30,6 +32,10 @@ def format_signal_alert(signal: Signal, market_data: MarketData, previous_direct
         lines.append(f'OI Δ5m:  {market_data.oi_change_5m:+.1f}%')
     if signal.funding_rate is not None:
         lines.append(f'FR:      {signal.funding_rate * 100:+.4f}%')
+        if signal.funding_rate > 0.002:
+            lines.append('⚠️ High FR: short-term trade only')
+        elif signal.funding_rate < -0.002:
+            lines.append('⚠️ High -FR: short positions decay fast')
     if signal.volume_24h:
         lines.append(f'Vol 24h: ${signal.volume_24h:,.0f}')
     if signal.market_cap_usd:
@@ -82,8 +88,14 @@ def format_squeeze_alert(alert: SqueezeAlert) -> str:
     is_long = alert.direction == 'LONG_SQUEEZE'
     is_strong = alert.alert_level == 'STRONG'
 
+    is_triggered = alert.alert_level == 'TRIGGERED'
     base_emoji = '⚡' if is_long else '💥'
-    prefix = f'🔥{base_emoji}' if is_strong else base_emoji
+    if is_triggered:
+        prefix = f'🚨{base_emoji}'
+    elif is_strong:
+        prefix = f'🔥{base_emoji}'
+    else:
+        prefix = base_emoji
     dir_label = 'LONG SQUEEZE' if is_long else 'SHORT SQUEEZE'
     header = f'{prefix} {dir_label} ({alert.alert_level}): {symbol}'
 
@@ -157,10 +169,16 @@ def format_analysis_result(symbol: str, analysis: dict, market_data: MarketData)
         lines.append(f'OI:      ${market_data.open_interest_usd:,.0f}')
     if market_data.oi_mc_ratio is not None:
         lines.append(f'OI/MC:   {market_data.oi_mc_ratio:.4f}')
+        if market_data.oi_mc_ratio > 0.30:
+            lines.append(f'⚠️ High leverage: OI/MC {market_data.oi_mc_ratio:.2f}')
     elif market_data.market_cap_usd is None:
         lines.append('OI/MC:   N/A (MC unknown)')
     if market_data.funding_rate is not None:
         lines.append(f'FR:      {market_data.funding_rate * 100:+.4f}%')
+        if market_data.funding_rate > 0.002:
+            lines.append('⚠️ High FR: short-term trade only')
+        elif market_data.funding_rate < -0.002:
+            lines.append('⚠️ High -FR: short positions decay fast')
     if market_data.volume_24h:
         lines.append(f'Vol 24h: ${market_data.volume_24h:,.0f}')
     if market_data.market_cap_usd:

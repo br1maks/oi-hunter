@@ -106,7 +106,10 @@ class AggressionAnalyzer(BaseAnalyzer):
                     reasoning_parts.append(f'5M floor: short {short_score:.1f}->{new_short:.1f} (5M={data.aggression_5m:.0f}%)')
                 long_score, short_score = new_long, new_short
         blocks_long = agg_2h < 30.0
-        blocks_short = agg_2h > 70.0
+        # 80% threshold: on MEXC retail is structurally long, so agg_2h > 70% is the normal
+        # baseline for most tokens — not a meaningful signal. Only block SHORT when buying
+        # is genuinely extreme (80%+ = "Very strong buying"), not just elevated.
+        blocks_short = agg_2h > 80.0
         # 5m override: lift the block when reliable 5m data clearly contradicts the 2h picture.
         # agg_2h lags up to 60 min — at reversal peaks it still reflects prior buying
         # while sellers have already taken over in the most recent 5 minutes.

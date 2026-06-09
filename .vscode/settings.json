@@ -1,6 +1,7 @@
 {
     "python.defaultInterpreterPath": "C:\\Users\\brink\\AppData\\Local\\pypoetry\\Cache\\virtualenvs\\oi-hunter-Jmd5XOHV-py3.13\\Scripts\\python.exe",
     "python.terminal.activateEnvironment": true,
+    "python.terminal.useEnvFile": true,
     "python.analysis.extraPaths": [
         "${workspaceFolder}/src"
     ],

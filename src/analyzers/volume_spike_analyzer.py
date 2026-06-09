@@ -44,6 +44,24 @@ class VolumeSpikeAnalyzer(BaseAnalyzer):
         else:
             return 0.0
 
+    def _is_post_crash_accumulation(self, data: MarketData) -> bool:
+        if data.price_change_24h is None or data.price_change_24h >= -35.0:
+            return False
+        if data.aggression_5m is not None and data.aggression_5m >= 60.0:
+            return True
+        if data.aggression_2h is not None and data.aggression_2h >= 60.0:
+            return True
+        return False
+
+    def _is_post_pump_distribution(self, data: MarketData) -> bool:
+        if data.price_change_24h is None or data.price_change_24h <= 50.0:
+            return False
+        if data.aggression_5m is not None and data.aggression_5m <= 40.0:
+            return True
+        if data.aggression_2h is not None and data.aggression_2h <= 40.0:
+            return True
+        return False
+
     def analyze(self, data: MarketData) -> Optional[AnalyzerResult]:
         if not self._validate_data(data):
             return None
@@ -53,20 +71,32 @@ class VolumeSpikeAnalyzer(BaseAnalyzer):
             return None
         price_change = data.price_change_1h if data.price_change_1h is not None else 0
         price_threshold = self._price_move_threshold(data)
+        is_divergence = False
         if price_change <= -price_threshold:
             long_score = 0.0
             short_score = spike_score
-            direction = 'BEARISH'
-            blocks_long = volume_ratio >= 2.0
             blocks_short = False
             is_early_detection = False
+            if self._is_post_crash_accumulation(data):
+                direction = 'BEARISH_DIVERGENCE'
+                blocks_long = False
+                is_divergence = True
+            else:
+                direction = 'BEARISH'
+                blocks_long = volume_ratio >= 2.0
         elif price_change >= price_threshold:
             long_score = spike_score
             short_score = 0.0
-            direction = 'BULLISH'
             blocks_long = False
-            blocks_short = volume_ratio >= 2.0
             is_early_detection = False
+            if self._is_post_pump_distribution(data):
+                direction = 'BULLISH_DIVERGENCE'
+                short_score = 4.0
+                blocks_short = False
+                is_divergence = True
+            else:
+                direction = 'BULLISH'
+                blocks_short = volume_ratio >= 2.0
         else:
             # PRE_PUMP/PRE_DUMP requires a reliable aggression reading.
             # Prefer 5m (current momentum) if count is sufficient; fall back to 2h if also sufficient.
@@ -108,12 +138,27 @@ class VolumeSpikeAnalyzer(BaseAnalyzer):
         if is_early_detection:
             price_str = f'{data.price_change_1h:+.1f}%' if data.price_change_1h is not None else 'N/A'
             reasoning = f'Volume spike {volume_ratio:.1f}x | Direction: {direction} (EARLY!) | Aggression ({agg_source}): {aggression:.0f}% | Price: {price_str}'
+        elif is_divergence:
+            if direction == 'BEARISH_DIVERGENCE':
+                agg_val = data.aggression_5m if (data.aggression_5m is not None and data.aggression_5m >= 60) else data.aggression_2h
+                agg_src = '5m' if (data.aggression_5m is not None and data.aggression_5m >= 60) else '2h'
+                reasoning = (f'Volume spike {volume_ratio:.1f}x | BEARISH_DIVERGENCE | '
+                             f'Price {price_change:+.1f}% but buyers {agg_val:.0f}% ({agg_src}) | '
+                             f'blocks_long lifted (post-crash accumulation)')
+            else:
+                agg_val = data.aggression_5m if (data.aggression_5m is not None and data.aggression_5m <= 40) else data.aggression_2h
+                agg_src = '5m' if (data.aggression_5m is not None and data.aggression_5m <= 40) else '2h'
+                reasoning = (f'Volume spike {volume_ratio:.1f}x | BULLISH_DIVERGENCE | '
+                             f'Price {price_change:+.1f}% but sellers {agg_val:.0f}% ({agg_src}) | '
+                             f'blocks_short lifted (post-pump distribution)')
         else:
             reasoning = f'Volume spike {volume_ratio:.1f}x | Direction: {direction} | Price change: {price_change:+.1f}%'
-        confidence = self._calculate_confidence(data, volume_ratio, is_early_detection)
+        confidence = self._calculate_confidence(data, volume_ratio, is_early_detection, is_divergence)
         return AnalyzerResult(analyzer_name=self.analyzer_name, long_score=long_score, short_score=short_score, confidence=confidence, reasoning=reasoning, blocks_long=blocks_long, blocks_short=blocks_short, alert_level=alert_level, key_value=volume_ratio, key_label='Volume Ratio')
 
-    def _calculate_confidence(self, data: MarketData, volume_ratio: float, is_early_detection: bool=False) -> float:
+    def _calculate_confidence(self, data: MarketData, volume_ratio: float, is_early_detection: bool = False, is_divergence: bool = False) -> float:
+        if is_divergence:
+            return 0.65
         if is_early_detection:
             if volume_ratio >= 5.0:
                 return 0.70

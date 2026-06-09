@@ -8,7 +8,7 @@ class SqueezeAlert:
     symbol: str
     timestamp: datetime
     direction: str              # 'LONG_SQUEEZE' or 'SHORT_SQUEEZE'
-    alert_level: str            # 'WATCH' or 'STRONG'
+    alert_level: str            # 'WATCH', 'STRONG', or 'TRIGGERED'
     squeeze_score: float        # 0–10 composite score
 
     # Component breakdown

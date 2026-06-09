@@ -13,7 +13,7 @@ class MEXCConfig:
     FUTURES_DEALS: Final[str] = '/api/v1/contract/deals'
     RATE_LIMIT_WEIGHT_PER_MINUTE: Final[int] = 1200
     RATE_LIMIT_REQUESTS_PER_SECOND: Final[int] = 20
-    REQUEST_TIMEOUT: Final[int] = 20
+    REQUEST_TIMEOUT: Final[int] = 10
     MAX_RETRIES: Final[int] = 3
     RETRY_DELAY: Final[float] = 1.0
 

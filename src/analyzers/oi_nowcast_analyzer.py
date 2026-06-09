@@ -17,7 +17,7 @@ def normalize_symbol(symbol: str) -> str:
 
 class OINowcastAnalyzer(BaseAnalyzer):
     MIN_POINTS_BASIC = 3
-    MIN_POINTS_ACCEL = 6
+    MIN_POINTS_ACCEL = 4
     MIN_POINTS_RELIABLE = 10
     _phase_cache: dict = {}
     _current_cycle_id: int = 0
@@ -237,10 +237,6 @@ class OINowcastAnalyzer(BaseAnalyzer):
         base_confidence = max(0.3, base_confidence)
         velocity_dir = '+' if velocity > 0 else ''
         velocity_pct = velocity / current_oi * 100
-        accel_status = ''
-        if num_points < self.MIN_POINTS_ACCEL:
-            accel_status = ' (accel: insufficient data)'
-
         def _fmt_pct(pct: float) -> str:
             if abs(pct) < 0.05:
                 return '~0%'
@@ -254,5 +250,5 @@ class OINowcastAnalyzer(BaseAnalyzer):
             phase_prefix = f'[{current_phase}]'
         collapse_note = (f' | SUSPICIOUS: OI {data.oi_change_1h:.0f}% collapse without price move (confidence*0.5)'
                          if suspicious_collapse else '')
-        reasoning = f"{phase_prefix} {interpretation} | Velocity: {velocity_dir}{velocity:,.0f} USD/min ({velocity_pct:+.3f}%/min){accel_status} | 5m: {_fmt_pct(predictions['5min']['predicted_change_pct'])}, 10m: {_fmt_pct(predictions['10min']['predicted_change_pct'])}, 15m: {_fmt_pct(predictions['15min']['predicted_change_pct'])}{price_dir_note}{collapse_note}"
+        reasoning = f"{phase_prefix} {interpretation} | Velocity: {velocity_dir}{velocity:,.0f} USD/min ({velocity_pct:+.3f}%/min) | 5m: {_fmt_pct(predictions['5min']['predicted_change_pct'])}, 10m: {_fmt_pct(predictions['10min']['predicted_change_pct'])}, 15m: {_fmt_pct(predictions['15min']['predicted_change_pct'])}{price_dir_note}{collapse_note}"
         return AnalyzerResult(analyzer_name=self.analyzer_name, long_score=long_score, short_score=short_score, confidence=base_confidence, reasoning=reasoning, key_value=pred_10min['predicted_change_pct'], key_label='Predicted OI 10m %', blocks_long=blocks_long, blocks_short=blocks_short, alert_level=alert_level)

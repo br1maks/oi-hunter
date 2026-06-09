@@ -79,6 +79,16 @@ class FundingRateAnalyzer(BaseAnalyzer):
                 elif fr_velocity < -0.0001:
                     reasoning += f' | FR↓ {v_pct:+.4f}% (funding weakening)'
         self._fr_cache[symbol] = rate
+        # Conflict guard: extreme negative FR requires OI growth to produce a squeeze.
+        # Shorts must keep building (OI growing) for a forced squeeze to happen.
+        # OI declining = shorts covering voluntarily, no forced squeeze coming.
+        # Cap long_score so FR alone cannot pass the signal threshold against bearish momentum.
+        if (rate <= -0.001
+                and data.oi_change_1h is not None and data.oi_change_1h < 0
+                and data.price_change_1h is not None and data.price_change_1h < -1.0):
+            if long_score > 6.0:
+                long_score = 6.0
+                reasoning += ' | No squeeze fuel: OI declining + price falling (capped 6.0)'
         return AnalyzerResult(analyzer_name=self.analyzer_name, long_score=long_score, short_score=short_score, confidence=confidence, reasoning=reasoning, blocks_long=blocks_long, blocks_short=blocks_short, alert_level=alert_level, key_value=rate_pct, key_label='Funding Rate %')
 
     def _calculate_confidence(self, data: MarketData) -> float:

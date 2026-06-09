@@ -208,17 +208,24 @@ class Monitor:
     async def _send_telegram_alerts(self, alerts: List[TokenSnapshot]):
         from ..analyzers.oi_nowcast_analyzer import normalize_symbol
         from ..api.exceptions import MEXCNotFoundException, MEXCRateLimitException
-        for snap in alerts:
+
+        async def _process_one(snap: TokenSnapshot) -> None:
             if snap.symbol in self._dead_symbols:
-                continue
+                return
             if self._alerter.is_on_cooldown(snap.symbol):
                 logger.info(f'[TG] {snap.symbol} on cooldown, skipping')
-                continue
+                return
             try:
-                market_data = await self._aggregator.aggregate(snap.symbol)
+                try:
+                    market_data = await asyncio.wait_for(
+                        self._aggregator.aggregate(snap.symbol), timeout=12.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f'[TG] {snap.symbol} → aggregate() timed out, skipping alert')
+                    return
                 if market_data is None:
                     logger.warning(f'[TG] {snap.symbol} → aggregate() returned None, skipping')
-                    continue
+                    return
                 db_symbol = normalize_symbol(snap.symbol)
                 market_data = self._enrich_oi_changes(market_data, db_symbol)
                 signal = self._generator.generate(market_data)
@@ -226,14 +233,16 @@ class Monitor:
                     await self._alerter.send_signal_alert(signal, market_data)
                     self._forward_tester.record_signal(signal, market_data)
                 else:
-                    logger.info(f'[TG] {snap.symbol} scan_score={max(snap.long_score, snap.short_score):.1f} → generate() returned None (see [Signal] log above)')
+                    logger.info(f'[TG] {snap.symbol} scan_score={max(snap.long_score, snap.short_score):.1f} → generate() returned None')
             except MEXCNotFoundException as e:
                 logger.warning(f'Symbol unavailable, skipping permanently: {snap.symbol} ({e})')
                 self._dead_symbols.add(snap.symbol)
-            except MEXCRateLimitException as e:
+            except MEXCRateLimitException:
                 logger.warning(f'Rate limit hit for {snap.symbol}, will retry next cycle')
             except Exception as e:
                 logger.error(f'Failed to send Telegram alert for {snap.symbol}: {e}')
+
+        await asyncio.gather(*[_process_one(snap) for snap in alerts], return_exceptions=True)
 
     def _check_alerts(self, snapshots: List[TokenSnapshot]) -> List[TokenSnapshot]:
         fresh = self._scanner.fresh_symbols
@@ -269,27 +278,51 @@ class Monitor:
         from ..analyzers.oi_nowcast_analyzer import normalize_symbol
         from ..api.exceptions import MEXCNotFoundException, MEXCRateLimitException
         candidates = sorted(candidates, key=lambda s: max(s.squeeze_long, s.squeeze_short), reverse=True)
+        # cap: fetch only top-40 by score — avoids flooding MEXC with 100+ simultaneous requests
+        candidates = candidates[:40]
+
+        # Phase 1: fetch market data in parallel with concurrency cap
+        sem = asyncio.Semaphore(10)
+
+        async def _fetch_one(snap: TokenSnapshot):
+            async with sem:
+                if snap.symbol in self._dead_symbols:
+                    return snap.symbol, None
+                if self._squeeze_detector._is_on_cooldown(snap.symbol):
+                    logger.info(f'[Squeeze] {snap.symbol} on cooldown, skipping')
+                    return snap.symbol, None
+                try:
+                    md = await asyncio.wait_for(
+                        self._aggregator.aggregate(snap.symbol), timeout=12.0
+                    )
+                    return snap.symbol, md
+                except asyncio.TimeoutError:
+                    logger.warning(f'[Squeeze] {snap.symbol} → aggregate() timed out, skipping alert')
+                    return snap.symbol, None
+                except MEXCNotFoundException as e:
+                    logger.warning(f'Symbol unavailable: {snap.symbol} ({e})')
+                    self._dead_symbols.add(snap.symbol)
+                    return snap.symbol, None
+                except Exception as e:
+                    logger.error(f'Failed to fetch squeeze data for {snap.symbol}: {e}')
+                    return snap.symbol, None
+
+        fetch_results = await asyncio.gather(*[_fetch_one(s) for s in candidates], return_exceptions=True)
+        md_map = {sym: md for r in fetch_results if isinstance(r, tuple) for sym, md in [r] if md is not None}
+
+        # Phase 2: process results sequentially to respect sent_strong cap
         sent_strong = 0
         for snap in candidates:
-            if snap.symbol in self._dead_symbols:
-                continue
-            if self._squeeze_detector._is_on_cooldown(snap.symbol):
-                logger.info(f'[Squeeze] {snap.symbol} on cooldown, skipping')
+            market_data = md_map.get(snap.symbol)
+            if market_data is None:
                 continue
             try:
-                market_data = await self._aggregator.aggregate(snap.symbol)
-                if market_data is None:
-                    logger.warning(f'[Squeeze] {snap.symbol} → aggregate() returned None, skipping')
-                    continue
                 db_symbol = normalize_symbol(snap.symbol)
                 market_data = self._enrich_oi_changes(market_data, db_symbol)
                 scores = self._squeeze_detector.detect(market_data, update_history=False)
-                result = self._squeeze_detector.should_alert(snap.symbol, scores)
+                result = self._squeeze_detector.should_alert(snap.symbol, scores, market_data)
                 if result is None:
-                    logger.info(
-                        f'[Squeeze] {snap.symbol} → no alert '
-                        f'(score dropped or C1/C2 both missing)'
-                    )
+                    logger.info(f'[Squeeze] {snap.symbol} → no alert (score dropped or C1/C2 both missing)')
                     continue
                 direction, level = result
                 if level == 'WATCH':
@@ -302,17 +335,14 @@ class Monitor:
                 if sent_strong >= self.MAX_SQUEEZE_ALERTS_PER_CYCLE:
                     logger.info(f'[Squeeze] cycle cap reached ({self.MAX_SQUEEZE_ALERTS_PER_CYCLE}), skipping {snap.symbol}')
                     continue
-                alert = self._squeeze_detector.build_alert(market_data, direction, scores)
+                alert = self._squeeze_detector.build_alert(market_data, direction, scores, level=level)
                 await self._alerter.send_squeeze_alert(alert)
                 self._squeeze_alerts_generated += 1
                 sent_strong += 1
                 logger.info(
-                    f'[Squeeze STRONG] {snap.symbol} → {direction} '
+                    f'[Squeeze {level}] {snap.symbol} → {direction} '
                     f'{alert.squeeze_score:.1f}/10 → Telegram ({sent_strong}/{self.MAX_SQUEEZE_ALERTS_PER_CYCLE})'
                 )
-            except MEXCNotFoundException as e:
-                logger.warning(f'Symbol unavailable: {snap.symbol} ({e})')
-                self._dead_symbols.add(snap.symbol)
             except MEXCRateLimitException:
                 logger.warning(f'Rate limit hit for {snap.symbol}, will retry next cycle')
             except Exception as e:

@@ -30,18 +30,26 @@ class SqueezeScores:
 class SqueezeDetector:
     ALERT_THRESHOLD_STRONG = 8.0
     ALERT_THRESHOLD_WATCH = 5.5
+    ALERT_THRESHOLD_TRIGGERED = 6.0   # min score to fire TRIGGERED (between WATCH and STRONG)
     MIN_OI_USD = 200_000
     MIN_VOLUME_24H = 200_000
     MAX_SPREAD_PCT = 2.5
     COOLDOWN_MINUTES = 30
+    COOLDOWN_TRIGGERED_MINUTES = 10   # shorter cooldown — TRIGGERED is time-critical
     WATCH_MIN_DURATION_MINUTES = 15  # symbol must have been in WATCH this long before STRONG → Telegram
     WATCH_EXPIRY_MINUTES = 60        # WATCH entry expires after this long (stale conditions)
     MIN_C3_TRADES = 20  # minimum independent trades for a reliable 5m aggression reading
+    VCI_COMPRESSED_THRESHOLD = 0.65  # VCI below this = spring coiled
+    VCI_EXPANDING_THRESHOLD = 0.80   # VCI above this (after compression) = spring releasing
+    VCI_MAX_AGE_SECONDS = 1200       # 20 min — discard prev VCI if token was absent that long
 
     def __init__(self):
-        self._cooldown: dict[str, datetime] = {}
+        # stores (timestamp, cooldown_minutes) — TRIGGERED uses shorter cooldown than STRONG
+        self._cooldown: dict[str, tuple[datetime, int]] = {}
         self._watch_log: dict[str, datetime] = {}
         self._ob_ratio_history: dict[str, deque] = {}
+        # Stores (vci_value, stored_at) — timestamp guards against stale reads after token gaps
+        self._vci_prev: dict[str, tuple[float, datetime]] = {}
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -95,6 +103,11 @@ class SqueezeDetector:
             short_score, c1_s, c2_s, c3_s, c4_s, fa_s,
         )
 
+        # Track VCI history for TRIGGERED detection (main scan only, not re-check calls).
+        # Timestamp lets should_alert() discard stale values from token-gap periods.
+        if update_history and data.vci is not None:
+            self._vci_prev[data.symbol] = (data.vci, datetime.now(timezone.utc))
+
         return SqueezeScores(
             long_score=round(long_score, 2),
             short_score=round(short_score, 2),
@@ -110,15 +123,19 @@ class SqueezeDetector:
         self,
         symbol: str,
         scores: SqueezeScores,
+        data: Optional[MarketData] = None,
     ) -> Optional[tuple]:
         """
         Returns (direction, level) or None.
         direction: 'LONG_SQUEEZE' or 'SHORT_SQUEEZE'
-        level: 'WATCH' (log only) or 'STRONG' (send Telegram)
+        level: 'WATCH' (log only) | 'STRONG' (send Telegram) | 'TRIGGERED' (send immediately)
 
-        Two-phase confirmation: STRONG is only promoted to Telegram if the symbol
-        previously reached WATCH state within WATCH_EXPIRY_MINUTES. This filters
-        out cold STRONG alerts that appear without a preceding warning phase.
+        Two-phase confirmation: STRONG requires prior WATCH within WATCH_EXPIRY_MINUTES.
+        TRIGGERED bypasses the wait when VCI expansion is detected in real time:
+          - VCI was compressed last cycle (< VCI_COMPRESSED_THRESHOLD)
+          - VCI is now expanding (> VCI_EXPANDING_THRESHOLD)
+          - aggression spike confirms direction (>= 70%)
+        Pass data=market_data from the monitor to enable TRIGGERED detection.
         """
         best = max(scores.long_score, scores.short_score)
         self._reset_cooldown_if_invalidated(symbol, best)
@@ -147,6 +164,42 @@ class SqueezeDetector:
 
         now = datetime.now(timezone.utc)
 
+        # TRIGGERED: VCI spring releasing right now — skip 15-min WATCH requirement.
+        # Requires: prev VCI compressed → current VCI expanding + directional aggression spike.
+        if data is not None and score >= self.ALERT_THRESHOLD_TRIGGERED:
+            prev_entry = self._vci_prev.get(symbol)
+            curr_vci = data.vci
+            agg = data.aggression_5m
+            tc = data.trade_count_5m
+
+            prev_vci = None
+            if prev_entry is not None:
+                stored_vci, stored_at = prev_entry
+                age_sec = (now - stored_at).total_seconds()
+                if age_sec <= self.VCI_MAX_AGE_SECONDS:
+                    prev_vci = stored_vci  # fresh enough to trust
+
+            vci_transition = (
+                prev_vci is not None
+                and prev_vci < self.VCI_COMPRESSED_THRESHOLD
+                and curr_vci is not None
+                and curr_vci > self.VCI_EXPANDING_THRESHOLD
+            )
+            # Aggression must be directionally confirmed with enough trades to be reliable
+            agg_reliable = tc is not None and tc >= self.MIN_C3_TRADES
+            if direction == 'LONG_SQUEEZE':
+                agg_confirms = agg_reliable and agg is not None and agg >= 70.0
+            else:
+                agg_confirms = agg_reliable and agg is not None and (100.0 - agg) >= 70.0
+            if vci_transition and agg_confirms:
+                self._set_cooldown(symbol, minutes=self.COOLDOWN_TRIGGERED_MINUTES)
+                self._clear_watch(symbol)
+                logger.info(
+                    '[Squeeze TRIGGERED] %s → %s | VCI %.3f→%.3f agg=%.1f score=%.1f',
+                    symbol, direction, prev_vci, curr_vci, agg, score,
+                )
+                return (direction, 'TRIGGERED')
+
         if score >= self.ALERT_THRESHOLD_STRONG and self._is_in_watch(symbol, now):
             self._set_cooldown(symbol)
             self._clear_watch(symbol)
@@ -161,8 +214,13 @@ class SqueezeDetector:
         data: MarketData,
         direction: str,
         scores: SqueezeScores,
+        level: Optional[str] = None,
     ) -> SqueezeAlert:
-        """Construct a SqueezeAlert from computed scores and market data."""
+        """Construct a SqueezeAlert from computed scores and market data.
+
+        Pass level='TRIGGERED'/'STRONG'/'WATCH' explicitly when known (from should_alert).
+        Falls back to score-based inference when level is None.
+        """
         if direction == 'LONG_SQUEEZE':
             score = scores.long_score
             c1, c2, c3, c4, fa = scores.c1_l, scores.c2_l, scores.c3_l, scores.c4_l, scores.fa_l
@@ -171,7 +229,10 @@ class SqueezeDetector:
                 if data.ob_bid_total and data.ob_ask_total and data.ob_ask_total > 0
                 else None
             )
-            reasoning = 'Watch for price break up → short liquidations trigger'
+            if level == 'TRIGGERED':
+                reasoning = 'VCI expanding now — short liquidations triggering'
+            else:
+                reasoning = 'Watch for price break up → short liquidations trigger'
         else:
             score = scores.short_score
             c1, c2, c3, c4, fa = scores.c1_s, scores.c2_s, scores.c3_s, scores.c4_s, scores.fa_s
@@ -180,7 +241,13 @@ class SqueezeDetector:
                 if data.ob_ask_total and data.ob_bid_total and data.ob_bid_total > 0
                 else None
             )
-            reasoning = 'Watch for price break down → long liquidations trigger'
+            if level == 'TRIGGERED':
+                reasoning = 'VCI expanding now — long liquidations triggering'
+            else:
+                reasoning = 'Watch for price break down → long liquidations trigger'
+
+        if level is None:
+            level = 'STRONG' if score >= self.ALERT_THRESHOLD_STRONG else 'WATCH'
 
         accel = None
         if data.aggression_5m is not None and data.aggression_2h is not None:
@@ -193,7 +260,7 @@ class SqueezeDetector:
             symbol=data.symbol,
             timestamp=datetime.now(timezone.utc),
             direction=direction,
-            alert_level='STRONG' if score >= self.ALERT_THRESHOLD_STRONG else 'WATCH',
+            alert_level=level,
             squeeze_score=round(score, 2),
             c1_score=round(c1, 1) if c1 is not None else None,
             c2_score=round(c2, 1) if c2 is not None else None,
@@ -251,6 +318,14 @@ class SqueezeDetector:
 
     def _c1_trapped_shorts(self, data: MarketData) -> Optional[float]:
         if data.oi_change_1h is None or data.price_change_1h is None:
+            return None
+        # Guard: absolute OI change must be significant — on small OI tokens a large %
+        # change can represent just $2k, which is noise from a single small trader
+        abs_change_usd = data.open_interest_usd * abs(data.oi_change_1h) / 100
+        if abs_change_usd < 5_000:
+            return None
+        # Guard: after a strong recent pump OI grows from FOMO longs, not trapped shorts
+        if data.price_change_4h is not None and data.price_change_4h > 20.0:
             return None
         oi = data.oi_change_1h
         pc = data.price_change_1h
@@ -406,6 +481,9 @@ class SqueezeDetector:
         pc = data.price_change_1h
         if oi is None or pc is None:
             return None
+        abs_change_usd = data.open_interest_usd * abs(oi) / 100
+        if abs_change_usd < 5_000:
+            return None
         if oi >= 8.0 and pc >= 3.0:
             return 7.0
         if oi >= 5.0 and pc >= 2.0:
@@ -509,8 +587,15 @@ class SqueezeDetector:
         """Volatility Compression Index boost. Applies to both directions."""
         if data.vci is None:
             return 0.0
-        # Post-pump distortion: after extreme pump ATR_20 inflated → VCI falsely low
-        pump_factor = 0.5 if (data.price_change_24h is not None and data.price_change_24h > 40.0) else 1.0
+        # Post-pump distortion: after recent pump ATR_20 inflated → VCI falsely low
+        # Use price_change_4h for more current context than 24h
+        pc4 = data.price_change_4h
+        if pc4 is not None and pc4 > 15.0:
+            pump_factor = 0.3   # last 4h were a pump → VCI compression is normalization, not signal
+        elif data.price_change_24h is not None and data.price_change_24h > 60.0:
+            pump_factor = 0.5   # large 24h pump but 4h normal → moderate dampening
+        else:
+            pump_factor = 1.0
         vci = data.vci
         if vci < 0.45:
             boost = 2.0
@@ -634,13 +719,16 @@ class SqueezeDetector:
     # ------------------------------------------------------------------
 
     def _is_on_cooldown(self, symbol: str) -> bool:
-        ts = self._cooldown.get(symbol)
-        if ts is None:
+        entry = self._cooldown.get(symbol)
+        if entry is None:
             return False
-        return (datetime.now(timezone.utc) - ts).total_seconds() < self.COOLDOWN_MINUTES * 60
+        ts, minutes = entry
+        return (datetime.now(timezone.utc) - ts).total_seconds() < minutes * 60
 
-    def _set_cooldown(self, symbol: str) -> None:
-        self._cooldown[symbol] = datetime.now(timezone.utc)
+    def _set_cooldown(self, symbol: str, minutes: Optional[int] = None) -> None:
+        if minutes is None:
+            minutes = self.COOLDOWN_MINUTES
+        self._cooldown[symbol] = (datetime.now(timezone.utc), minutes)
 
     def _reset_cooldown_if_invalidated(self, symbol: str, score: float) -> None:
         # Do not reset cooldown based on score — time-based expiry only.
@@ -656,8 +744,10 @@ class SqueezeDetector:
         return self.WATCH_MIN_DURATION_MINUTES <= elapsed_min <= self.WATCH_EXPIRY_MINUTES
 
     def _record_watch(self, symbol: str, now: datetime) -> None:
-        # Preserve the original entry time — duration is measured from first WATCH detection
-        if symbol not in self._watch_log:
+        # Preserve original entry time, but reset if the previous entry expired.
+        # Without the reset, an expired entry blocks the WATCH→STRONG cycle indefinitely.
+        existing = self._watch_log.get(symbol)
+        if existing is None or (now - existing).total_seconds() / 60 > self.WATCH_EXPIRY_MINUTES:
             self._watch_log[symbol] = now
 
     def _clear_watch(self, symbol: str) -> None:
